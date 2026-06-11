@@ -5,6 +5,7 @@ env:
   MACOSX_DEPLOYMENT_TARGET: '10.13'
   CARGO_INCREMENTAL: '1'
 'on':
+  workflow_dispatch: {}
   push:
     branches:
       - main
