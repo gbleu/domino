@@ -56,9 +56,11 @@ pub fn discover_projects(cwd: &Path) -> Result<Vec<Project>> {
           projects.iter().map(|p| p.root.clone()).collect();
         let known_names: std::collections::HashSet<String> =
           projects.iter().map(|p| p.name.clone()).collect();
-        projects.extend(ws_projects.into_iter().filter(|p| {
-          !known_roots.contains(&p.root) && !known_names.contains(&p.name)
-        }));
+        projects.extend(
+          ws_projects
+            .into_iter()
+            .filter(|p| !known_roots.contains(&p.root) && !known_names.contains(&p.name)),
+        );
       }
     }
     return Ok(projects);
