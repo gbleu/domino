@@ -142,6 +142,21 @@ impl<'a> ReferenceFinder<'a> {
     // Also check for namespace imports (import * as foo)
     let namespace_key = (current_file.to_path_buf(), "*".to_string());
     if let Some(importers) = self.analyzer.import_index.get(&namespace_key) {
+      // Is the symbol being propagated the module's default export? A default
+      // export is recorded either under the name "default" (anonymous default,
+      // container-symbol resolution) or under its local identifier with
+      // exported_name == "default" (`export default Page`).
+      let is_default_export_symbol = symbol_name == "default"
+        || self
+          .analyzer
+          .exports
+          .get(current_file)
+          .is_some_and(|exports| {
+            exports
+              .iter()
+              .any(|e| e.exported_name == "default" && e.local_name.as_deref() == Some(symbol_name))
+          });
+
       for (importing_file, local_name, _from_module, is_dynamic) in importers {
         debug!(
           "Found {} namespace import in {:?} as '{}' (checking for {}.{})",
@@ -152,8 +167,42 @@ impl<'a> ReferenceFinder<'a> {
           symbol_name
         );
 
-        // For namespace imports, we need to find references to namespace.symbol specifically
-        // (e.g., utils.formatDate, not just any reference to utils)
+        if *is_dynamic {
+          // The local binding of a dynamic import is synthetic ("__dynamic_import_N",
+          // see DynamicImportVisitor) — it never appears as an identifier in the
+          // source, so the member-access analysis below can never attribute usage
+          // to it: requiring member access makes dynamic imports propagate nothing
+          // at all. But `React.lazy(() => import('./Page'))` DOES consume the
+          // module's default export — React reads `.default` at runtime, invisibly
+          // to static analysis. So cascade exactly that: when the propagated symbol
+          // is the module's default export, conservatively mark the importing file
+          // affected (line=0/column=0 sentinel — "entire file affected", core.rs).
+          // Named exports keep the lazy-boundary isolation introduced in #69:
+          // accessing them requires a visible binding (`.then(m => m.foo)`,
+          // `await import()`) that this analysis does not track.
+          if is_default_export_symbol {
+            debug!(
+              "Dynamic import of {:?} in {:?} consumes its default export ('{}') — \
+               marking importing file conservatively affected",
+              current_file, importing_file, symbol_name
+            );
+            all_refs.push(Reference {
+              file_path: importing_file.clone(),
+              line: 0,
+              column: 0,
+            });
+          } else {
+            debug!(
+              "No cascade of non-default symbol '{}' through dynamic import in {:?} \
+               (lazy boundary isolates named exports)",
+              symbol_name, importing_file
+            );
+          }
+          continue;
+        }
+
+        // For static namespace imports, we need to find references to namespace.symbol
+        // specifically (e.g., utils.formatDate, not just any reference to utils)
         match self
           .analyzer
           .find_namespace_member_access(importing_file, local_name, symbol_name)
@@ -169,24 +218,10 @@ impl<'a> ReferenceFinder<'a> {
                 importing_file
               );
               all_refs.extend(member_refs);
-            } else if *is_dynamic {
-              // Dynamic imports with string literal specifiers (which is all tracked dynamic
-              // imports — non-string-literal ones are skipped during extraction) are treated
-              // like static namespace imports: if we can't find member access to the specific
-              // changed symbol, we don't mark the file as affected.
-              //
-              // This prevents React.lazy(() => import('./SomePage')) from cascading all
-              // exports when a deep dependency of SomePage changes. The lazy boundary
-              // acts as an isolation point — only explicit member access propagates.
-              debug!(
-                "No local references to dynamic namespace '{}' for symbol '{}' in {:?} — \
-                 specifier is a static string literal, treating like static namespace import (no cascade)",
-                local_name, symbol_name, importing_file
-              );
             }
-            // For both static and dynamic namespace imports, if we don't find any references
-            // to 'namespace.symbol', we don't mark the file as affected (strict behavior)
-            // since the namespace either doesn't use this specific symbol or is dead code.
+            // If we don't find any references to 'namespace.symbol', we don't mark
+            // the file as affected (strict behavior) since the namespace either
+            // doesn't use this specific symbol or is dead code.
           }
           Err(e) => {
             // Propagate the error instead of silently marking as affected
@@ -670,6 +705,76 @@ mod tests {
       resolved_path,
       PathBuf::from("src/models/index.ts"),
       "Expected to resolve ./models/index.js to models/index.ts"
+    );
+  }
+
+  #[test]
+  fn test_dynamic_import_cascades_default_export_only() {
+    // React.lazy(() => import('./page')) consumes the module's default export
+    // through a synthetic binding member-access analysis can never see.
+    // The default export must cascade (entire-file sentinel); named exports
+    // keep the lazy-boundary isolation.
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    // Canonicalize: on macOS TempDir lives under /var -> /private/var; the
+    // resolver returns canonical paths and strip_prefix(cwd) needs them to match.
+    let cwd = temp_dir
+      .path()
+      .canonicalize()
+      .expect("Failed to canonicalize temp dir");
+    let cwd = cwd.as_path();
+
+    let app_dir = cwd.join("app");
+    fs::create_dir_all(&app_dir).expect("Failed to create app dir");
+    fs::write(
+      app_dir.join("page.tsx"),
+      "export default function Page() { return null; }\n\
+       export function helper() { return 1; }\n",
+    )
+    .expect("Failed to write page.tsx");
+    fs::write(
+      app_dir.join("router.tsx"),
+      "import { lazy } from 'react';\n\
+       const Page = lazy(() => import('./page'));\n\
+       export const routes = [Page];\n",
+    )
+    .expect("Failed to write router.tsx");
+
+    let profiler = Arc::new(Profiler::new(false));
+    let projects = vec![crate::types::Project {
+      name: "app".to_string(),
+      root: PathBuf::from("app"),
+      source_root: PathBuf::from("app"),
+      ts_config: None,
+      implicit_dependencies: vec![],
+      targets: vec![],
+    }];
+    let analyzer =
+      WorkspaceAnalyzer::new(projects, cwd, profiler.clone()).expect("Failed to create analyzer");
+    let reference_finder = ReferenceFinder::new(&analyzer, cwd, profiler);
+
+    let page = PathBuf::from("app/page.tsx");
+    let router = PathBuf::from("app/router.tsx");
+
+    let default_refs = reference_finder
+      .find_cross_file_references("default", &page)
+      .expect("find_cross_file_references failed for 'default'");
+    assert!(
+      default_refs
+        .iter()
+        .any(|r| r.file_path == router && r.line == 0 && r.column == 0),
+      "Dynamic importer should be conservatively affected (sentinel) by a \
+       default-export change, got: {:?}",
+      default_refs
+    );
+
+    let helper_refs = reference_finder
+      .find_cross_file_references("helper", &page)
+      .expect("find_cross_file_references failed for 'helper'");
+    assert!(
+      !helper_refs.iter().any(|r| r.file_path == router),
+      "Named export must not cascade through the dynamic import (lazy-boundary \
+       isolation), got: {:?}",
+      helper_refs
     );
   }
 }
