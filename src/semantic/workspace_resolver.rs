@@ -50,7 +50,10 @@ impl WorkspaceResolver {
     let from_path = self.cwd.join(importing_file);
     let context = from_path.parent()?;
 
-    if let Some(paths) = self.nearest_tsconfig_paths(context) {
+    if let Some(paths) = self
+      .nearest_tsconfig_paths(context)
+      .filter(|_| !is_relative_specifier(specifier))
+    {
       let aliased = paths
         .candidates(specifier)
         .into_iter()
@@ -107,6 +110,15 @@ impl WorkspaceResolver {
   }
 }
 
+/// TypeScript's `pathIsRelative`: `./x`, `../x`, `.` and `..` resolve from the importing
+/// file and never through `paths`, even a catch-all `"*"` key.
+fn is_relative_specifier(specifier: &str) -> bool {
+  specifier
+    .strip_prefix("..")
+    .or_else(|| specifier.strip_prefix('.'))
+    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\'))
+}
+
 /// A poisoned lock only means another thread panicked mid-insert; the map itself is
 /// still a valid cache, so keep using it.
 fn read_cache(cache: &TsconfigPathsCache, key: &Path) -> Option<Option<Arc<TsconfigPaths>>> {
@@ -122,4 +134,40 @@ fn write_cache(cache: &TsconfigPathsCache, key: PathBuf, value: Option<Arc<Tscon
     .write()
     .unwrap_or_else(|poisoned| poisoned.into_inner())
     .insert(key, value);
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::fs;
+  use tempfile::TempDir;
+
+  #[test]
+  fn test_paths_skip_relative_specifiers() {
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path().canonicalize().unwrap();
+    fs::create_dir_all(cwd.join("src")).unwrap();
+    fs::create_dir_all(cwd.join("types")).unwrap();
+    fs::write(
+      cwd.join("tsconfig.json"),
+      r#"{ "compilerOptions": { "paths": { "*": ["./types/*"] } } }"#,
+    )
+    .unwrap();
+    fs::write(cwd.join("src/foo.ts"), "export const foo = 1;").unwrap();
+    fs::write(cwd.join("types/foo.ts"), "export const foo = 2;").unwrap();
+    fs::write(cwd.join("types/react.ts"), "export const react = 1;").unwrap();
+
+    let resolver = WorkspaceResolver::new(&cwd, vec![], vec![]);
+
+    assert_eq!(
+      resolver.resolve(Path::new("src/app.ts"), "./foo"),
+      Some(PathBuf::from("src/foo.ts")),
+      "a relative import resolves from the importing file, never through `paths`"
+    );
+    assert_eq!(
+      resolver.resolve(Path::new("src/app.ts"), "react"),
+      Some(PathBuf::from("types/react.ts")),
+      "a bare specifier still goes through `paths`"
+    );
+  }
 }
