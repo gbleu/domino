@@ -1,5 +1,4 @@
 use crate::types::Project;
-use json_strip_comments::StripComments;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -220,11 +219,16 @@ fn existing_config(path: PathBuf) -> Option<PathBuf> {
   with_extension.is_file().then_some(with_extension)
 }
 
+/// tsconfig files are JSONC: comments and trailing commas are both valid. The buffer
+/// form of `json_strip_comments` removes both, the streaming reader only comments.
 fn read_tsconfig(path: &Path) -> Option<TsconfigJson> {
-  let content = std::fs::read_to_string(path)
+  let mut content = std::fs::read_to_string(path)
     .map_err(|e| warn!("Failed to read {}: {}", path.display(), e))
     .ok()?;
-  serde_json::from_reader(StripComments::new(content.as_bytes()))
+  json_strip_comments::strip(&mut content)
+    .map_err(|e| warn!("Failed to strip comments from {}: {}", path.display(), e))
+    .ok()?;
+  serde_json::from_str(&content)
     .map_err(|e| warn!("Failed to parse {}: {}", path.display(), e))
     .ok()
 }
@@ -354,6 +358,55 @@ mod tests {
     assert_eq!(
       paths.candidates("react"),
       vec![PathBuf::from("/ws/types/react")]
+    );
+  }
+
+  #[test]
+  fn test_trailing_commas_and_comments() {
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path();
+    fs::write(
+      cwd.join("tsconfig.json"),
+      r#"{
+  // JSONC, as TypeScript accepts it
+  "compilerOptions": {
+    "paths": { "$pages/*": ["./src/pages/*",], },
+  },
+}"#,
+    )
+    .unwrap();
+
+    let paths = TsconfigPaths::load(&cwd.join("tsconfig.json"), cwd, &[]).unwrap();
+
+    assert_eq!(
+      paths.candidates("$pages/Home"),
+      vec![cwd.join("src/pages/Home")]
+    );
+  }
+
+  /// TypeScript's `getPathsBasePath` is `options.baseUrl ?? options.pathsBasePath`: an
+  /// effective `baseUrl` wins even when `paths` was declared by a parent config.
+  #[test]
+  fn test_child_base_url_applies_to_inherited_paths() {
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path();
+    fs::create_dir_all(cwd.join("apps/web")).unwrap();
+    fs::write(
+      cwd.join("tsconfig.shared.json"),
+      r#"{ "compilerOptions": { "paths": { "@lib/*": ["lib/*"] } } }"#,
+    )
+    .unwrap();
+    fs::write(
+      cwd.join("apps/web/tsconfig.json"),
+      r#"{ "extends": "../../tsconfig.shared.json", "compilerOptions": { "baseUrl": "." } }"#,
+    )
+    .unwrap();
+
+    let paths = TsconfigPaths::load(&cwd.join("apps/web/tsconfig.json"), cwd, &[]).unwrap();
+
+    assert_eq!(
+      paths.candidates("@lib/button"),
+      vec![cwd.join("apps/web/lib/button")]
     );
   }
 
