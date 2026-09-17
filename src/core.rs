@@ -10,7 +10,6 @@ use crate::types::{
 };
 use crate::utils::{self, ProjectIndex};
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -100,17 +99,47 @@ fn find_affected_internal(
     });
   }
 
-  // Step 1b: Apply Nx namedInputs — collect global-invalidation triggers and
-  // apply negation filtering.
+  // Step 1b: Apply the workspace's global-invalidation config — Nx
+  // `namedInputs` or Turborepo `globalDependencies`, whichever the workspace
+  // uses (see `resolve_global_inputs` for precedence) — collecting global
+  // triggers and applying negation filtering.
   //
   // When --report is NOT requested, a single global trigger lets us match
-  // `nx affected` immediately without running the expensive semantic pipeline.
-  // When --report IS requested, we continue through semantic analysis even on
-  // a global run so the HTML can separate "globally invalidated" from
-  // "semantically affected" projects — the whole point of the report.
-  let resolved_inputs = named_inputs::resolve_from_nx_json(&config.cwd);
+  // `nx affected` / `turbo run --filter` immediately without running the
+  // expensive semantic pipeline. When --report IS requested, we continue through
+  // semantic analysis even on a global run so the HTML can separate "globally
+  // invalidated" from "semantically affected" projects — the whole point of the
+  // report.
+  let resolved_inputs = named_inputs::resolve_global_inputs(&config.cwd);
+
+  // Detect the package manager up front so dependency-manifest files (the
+  // package manager's lockfile and the workspace-root package.json) can be
+  // exempted from global invalidation below.
+  let detected_pm = lockfile::detect_package_manager(&config.cwd);
+  let lockfile_filename = detected_pm.as_ref().map(|pm| lockfile::lockfile_name(pm));
+  let lockfile_changed = detected_pm
+    .as_ref()
+    .is_some_and(|pm| lockfile::has_lockfile_changed(&changed_files, pm));
+
+  // Dependency manifests (the lockfile, and package.json when the lockfile also
+  // changed) are exempt from global invalidation so the lockfile analysis
+  // (Step 5c) computes the real affected set instead of short-circuiting to "all
+  // projects". The exemption is gated on that analysis actually running: under
+  // `LockfileStrategy::None` there is no Step 5c, so a manifest listed in
+  // `sharedGlobals` / `globalDependencies` stays a global trigger rather than
+  // being silently dropped
+  // (which would flip all → 0 — the same under-inclusion the package.json guard
+  // prevents). Any *other* global trigger (.nvmrc, nx.json, ...) always
+  // invalidates every project.
+  let lockfile_analysis_enabled = !matches!(config.lockfile_strategy, LockfileStrategy::None);
   let global_triggers: Vec<GlobalTrigger> = if let Some(ref inputs) = resolved_inputs {
     named_inputs::check_global_invalidation(inputs, &changed_files)
+      .into_iter()
+      .filter(|t| {
+        !(lockfile_analysis_enabled
+          && lockfile::is_dependency_manifest(&t.file, detected_pm.as_ref(), lockfile_changed))
+      })
+      .collect()
   } else {
     Vec::new()
   };
@@ -148,11 +177,9 @@ fn find_affected_internal(
   let mut affected_packages = FxHashSet::default();
   let mut project_causes: FxHashMap<String, Vec<AffectCause>> = FxHashMap::default();
 
-  // Step 5: Partition changed files into source and non-source (excluding lockfiles)
-  let detected_pm = lockfile::detect_package_manager(&config.cwd);
-  let lockfile_filename = detected_pm.as_ref().map(|pm| lockfile::lockfile_name(pm));
-
-  // Step 6: Partition changed files into source and non-source
+  // Step 6: Partition changed files into source and non-source (excluding the
+  // lockfile). `detected_pm` / `lockfile_filename` were computed above so the
+  // dependency-manifest exemption and this partition share one detection.
   let (source_files, asset_files): (Vec<&ChangedFile>, Vec<&ChangedFile>) = changed_files
     .iter()
     .filter(|f| {
@@ -172,9 +199,8 @@ fn find_affected_internal(
   for changed_file in &source_files {
     let file_path = &changed_file.file_path;
 
-    // Check if file exists in our analyzed files. A source-typed file
-    // (.ts/.tsx/.js/.jsx/.mts/.mjs/.cts/.cjs) can live inside a project's root
-    // but outside its sourceRoot (e.g. jest.config.js,
+    // Check if file exists in our analyzed files. A source-typed file (.ts/.tsx/.js/.jsx)
+    // can live inside a project's root but outside its sourceRoot (e.g. jest.config.js,
     // webpack.config.js at project root when sourceRoot = "<proj>/src"). The semantic
     // analyzer only walks sourceRoot, so such files never reach it — but they still
     // belong to the project and changing them must mark it affected. Fall back to the
@@ -223,6 +249,39 @@ fn find_affected_internal(
       )
       .collect();
 
+    // Recover symbols removed by pure-deletion hunks. Their lines are gone from
+    // the working tree, so `find_node_at_line` above (which reads the current
+    // file) can't see them; instead we re-parse the file at the base revision
+    // and resolve the enclosing top-level symbol at each deleted line. This is
+    // what lets dependents of a deleted symbol — an object property, a `switch`
+    // case, or a whole exported declaration — be traced. Consumers still import
+    // the symbol in the current graph, so the traversal below reaches them.
+    let deleted_symbols: Vec<String> = if changed_file.deleted_lines.is_empty() {
+      Vec::new()
+    } else {
+      match git::get_file_at_revision(&config.cwd, &merge_base, file_path) {
+        Ok(Some(base_source)) => {
+          analyzer.find_deleted_symbols(file_path, &base_source, &changed_file.deleted_lines)
+        }
+        Ok(None) => Vec::new(),
+        Err(e) => {
+          debug!(
+            "Failed to read base revision of {:?} for deleted-symbol recovery: {}",
+            file_path, e
+          );
+          Vec::new()
+        }
+      }
+    };
+    if !deleted_symbols.is_empty() {
+      debug!(
+        "Recovered {} deleted symbol(s) from base revision of {:?}: {:?}",
+        deleted_symbols.len(),
+        file_path,
+        deleted_symbols
+      );
+    }
+
     // Add all packages that own this file (multiple projects can share the same sourceRoot).
     // Uses the unfiltered lookup — a directly changed file always belongs to its project
     // regardless of tsconfig excludes (spec files, stories, config files all count).
@@ -256,16 +315,31 @@ fn find_affected_internal(
             }
           }
         }
+
+        // Deleted symbols have no surviving new-side line; record them at line 0
+        // so the report still explains why the owning package is affected.
+        for symbol in &deleted_symbols {
+          project_causes
+            .entry(pkg.clone())
+            .or_default()
+            .push(AffectCause::DirectChange {
+              file: file_path.clone(),
+              symbol: Some(symbol.clone()),
+              line: 0,
+            });
+        }
       }
     }
 
-    // Pre-deduplicate: collect unique symbols across all changed lines before tracing.
-    // This avoids redundant recursive reference traversals when many changed lines
-    // map to the same symbol (e.g., additions inside a single large exported object).
-    let unique_symbols: FxHashSet<&String> = symbols_by_line
+    // Pre-deduplicate: collect unique symbols across all changed lines (plus any
+    // recovered from deletions) before tracing. This avoids redundant recursive
+    // reference traversals when many changed lines map to the same symbol (e.g.
+    // additions inside a single large exported object).
+    let mut unique_symbols: FxHashSet<&String> = symbols_by_line
       .iter()
       .flat_map(|(_, symbols)| symbols.iter())
       .collect();
+    unique_symbols.extend(deleted_symbols.iter());
 
     if unique_symbols.is_empty() {
       debug!(
@@ -274,9 +348,10 @@ fn find_affected_internal(
       );
     } else {
       debug!(
-        "Found {} unique symbols from {} changed lines in {:?}",
+        "Found {} unique symbols from {} changed and {} deleted lines in {:?}",
         unique_symbols.len(),
         changed_file.changed_lines.len(),
+        changed_file.deleted_lines.len(),
         file_path
       );
 
@@ -320,6 +395,19 @@ fn find_affected_internal(
     debug!("Processing {} asset files", asset_files.len());
     let asset_finder = AssetReferenceFinder::new(&config.cwd);
 
+    // Scan the workspace exactly once for the whole batch of changed assets,
+    // instead of once per asset (a full directory walk + re-reading every
+    // source file, per asset, was the dominant cost for PRs touching many
+    // assets).
+    let asset_paths: Vec<PathBuf> = asset_files.iter().map(|f| f.file_path.clone()).collect();
+    let mut asset_references_by_path = match asset_finder.find_references_batch(&asset_paths) {
+      Ok(references) => references,
+      Err(e) => {
+        debug!("Error finding references for asset batch: {}", e);
+        FxHashMap::default()
+      }
+    };
+
     for asset_file in &asset_files {
       let asset_path = &asset_file.file_path;
 
@@ -339,126 +427,90 @@ fn find_affected_internal(
         }
       }
 
-      // Find source files that reference this asset
-      match asset_finder.find_references(asset_path) {
-        Ok(references) => {
-          debug!(
-            "Found {} references to asset {:?}",
-            references.len(),
-            asset_path
-          );
+      // Find source files that reference this asset — looked up from the
+      // single batched scan performed above for all changed assets, rather
+      // than re-scanning the workspace per asset.
+      {
+        let references = asset_references_by_path
+          .remove(asset_path)
+          .unwrap_or_default();
+        debug!(
+          "Found {} references to asset {:?}",
+          references.len(),
+          asset_path
+        );
 
-          for reference in references {
-            let source_file_rel = &reference.source_file;
+        for reference in references {
+          let source_file_rel = &reference.source_file;
 
-            // Mark all referencing projects as affected
-            let ref_packages = project_index.get_package_names_by_path(source_file_rel);
-            for pkg in &ref_packages {
-              affected_packages.insert(pkg.clone());
+          // Mark all referencing projects as affected
+          let ref_packages = project_index.get_package_names_by_path(source_file_rel);
+          for pkg in &ref_packages {
+            affected_packages.insert(pkg.clone());
 
-              // Record asset change cause if generating report
-              if generate_report {
-                project_causes
-                  .entry(pkg.clone())
-                  .or_default()
-                  .push(AffectCause::AssetChange {
-                    asset_file: asset_path.clone(),
-                    referenced_in: source_file_rel.clone(),
-                    line: reference.line,
-                  });
-              }
-            }
-
-            // Find the import binding that references this asset
-            // The asset is referenced via an import like:
-            //   import diamondLottie from '../../../assets/lotties/analysis/diamond.json';
-            // We need to find the local name (diamondLottie) and then trace all exports that use it
-
-            // Get the asset filename to match against import paths
-            let asset_filename = asset_path
-              .file_name()
-              .and_then(|n| n.to_str())
-              .unwrap_or("");
-
-            // Look for an import in this file that matches the asset path
-            let import_local_name =
-              analyzer
-                .imports
-                .get(source_file_rel)
-                .and_then(|file_imports| {
-                  file_imports.iter().find_map(|import| {
-                    // Check if the import's from_module contains the asset filename
-                    if import.from_module.contains(asset_filename) {
-                      debug!(
-                        "Found import '{}' (local: '{}') matching asset '{}'",
-                        import.from_module, import.local_name, asset_filename
-                      );
-                      Some(import.local_name.clone())
-                    } else {
-                      None
-                    }
-                  })
+            // Record asset change cause if generating report
+            if generate_report {
+              project_causes
+                .entry(pkg.clone())
+                .or_default()
+                .push(AffectCause::AssetChange {
+                  asset_file: asset_path.clone(),
+                  referenced_in: source_file_rel.clone(),
+                  line: reference.line,
                 });
+            }
+          }
 
-            if let Some(local_name) = import_local_name {
-              debug!(
-                "Asset import local name: '{}' in {:?}",
-                local_name, source_file_rel
-              );
+          // Find the import binding that references this asset
+          // The asset is referenced via an import like:
+          //   import diamondLottie from '../../../assets/lotties/analysis/diamond.json';
+          // We need to find the local name (diamondLottie) and then trace all exports that use it
 
-              // Find exported symbols that use this import
-              // E.g., if "diamondLottie" is imported and used by "Diamond" export,
-              // we need to trace "Diamond" to find affected projects
-              match analyzer.find_exported_symbols_using(source_file_rel, &local_name) {
-                Ok(exported_symbols) if !exported_symbols.is_empty() => {
+          // Get the asset filename to match against import paths
+          let asset_filename = asset_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+          // Look for an import in this file that matches the asset path
+          let import_local_name = analyzer
+            .imports
+            .get(source_file_rel)
+            .and_then(|file_imports| {
+              file_imports.iter().find_map(|import| {
+                // Check if the import's from_module contains the asset filename
+                if import.from_module.contains(asset_filename) {
                   debug!(
-                    "Found {} exported symbols using '{}': {:?}",
-                    exported_symbols.len(),
-                    local_name,
-                    exported_symbols
+                    "Found import '{}' (local: '{}') matching asset '{}'",
+                    import.from_module, import.local_name, asset_filename
                   );
-
-                  // Trace each exported symbol that uses the import
-                  for export_symbol in exported_symbols {
-                    let mut visited = FxHashSet::default();
-                    let mut state = AffectedState {
-                      affected_packages: &mut affected_packages,
-                      project_causes: if generate_report {
-                        Some(&mut project_causes)
-                      } else {
-                        None
-                      },
-                      visited: &mut visited,
-                    };
-
-                    debug!(
-                      "Tracing exported symbol '{}' from asset reference",
-                      export_symbol
-                    );
-
-                    if let Err(e) = process_changed_symbol(
-                      &analyzer,
-                      &reference_finder,
-                      source_file_rel,
-                      &export_symbol,
-                      &project_index,
-                      &mut state,
-                    ) {
-                      debug!(
-                        "Error processing exported symbol '{}' from asset reference: {}",
-                        export_symbol, e
-                      );
-                    }
-                  }
+                  Some(import.local_name.clone())
+                } else {
+                  None
                 }
-                Ok(_) => {
-                  // No exported symbols use this import - the import is unused or only used internally
-                  // Still try to trace the import symbol itself in case it's directly exported
-                  debug!(
-                    "No exported symbols use '{}', tracing import symbol directly",
-                    local_name
-                  );
+              })
+            });
 
+          if let Some(local_name) = import_local_name {
+            debug!(
+              "Asset import local name: '{}' in {:?}",
+              local_name, source_file_rel
+            );
+
+            // Find exported symbols that use this import
+            // E.g., if "diamondLottie" is imported and used by "Diamond" export,
+            // we need to trace "Diamond" to find affected projects
+            match analyzer.find_exported_symbols_using(source_file_rel, &local_name) {
+              Ok(exported_symbols) if !exported_symbols.is_empty() => {
+                debug!(
+                  "Found {} exported symbols using '{}': {:?}",
+                  exported_symbols.len(),
+                  local_name,
+                  exported_symbols
+                );
+
+                // Trace each exported symbol that uses the import
+                for export_symbol in exported_symbols {
                   let mut visited = FxHashSet::default();
                   let mut state = AffectedState {
                     affected_packages: &mut affected_packages,
@@ -470,37 +522,72 @@ fn find_affected_internal(
                     visited: &mut visited,
                   };
 
+                  debug!(
+                    "Tracing exported symbol '{}' from asset reference",
+                    export_symbol
+                  );
+
                   if let Err(e) = process_changed_symbol(
                     &analyzer,
                     &reference_finder,
                     source_file_rel,
-                    &local_name,
+                    &export_symbol,
                     &project_index,
                     &mut state,
                   ) {
                     debug!(
-                      "Error processing import symbol '{}' from asset reference: {}",
-                      local_name, e
+                      "Error processing exported symbol '{}' from asset reference: {}",
+                      export_symbol, e
                     );
                   }
                 }
-                Err(e) => {
+              }
+              Ok(_) => {
+                // No exported symbols use this import - the import is unused or only used internally
+                // Still try to trace the import symbol itself in case it's directly exported
+                debug!(
+                  "No exported symbols use '{}', tracing import symbol directly",
+                  local_name
+                );
+
+                let mut visited = FxHashSet::default();
+                let mut state = AffectedState {
+                  affected_packages: &mut affected_packages,
+                  project_causes: if generate_report {
+                    Some(&mut project_causes)
+                  } else {
+                    None
+                  },
+                  visited: &mut visited,
+                };
+
+                if let Err(e) = process_changed_symbol(
+                  &analyzer,
+                  &reference_finder,
+                  source_file_rel,
+                  &local_name,
+                  &project_index,
+                  &mut state,
+                ) {
                   debug!(
-                    "Error finding exported symbols using '{}': {}",
+                    "Error processing import symbol '{}' from asset reference: {}",
                     local_name, e
                   );
                 }
               }
-            } else {
-              debug!(
-                "No import found for asset '{}' in {:?}",
-                asset_filename, source_file_rel
-              );
+              Err(e) => {
+                debug!(
+                  "Error finding exported symbols using '{}': {}",
+                  local_name, e
+                );
+              }
             }
+          } else {
+            debug!(
+              "No import found for asset '{}' in {:?}",
+              asset_filename, source_file_rel
+            );
           }
-        }
-        Err(e) => {
-          debug!("Error finding references to asset {:?}: {}", asset_path, e);
         }
       }
     }
@@ -509,7 +596,12 @@ fn find_affected_internal(
   // Step 5c: Process lockfile changes
   if !matches!(config.lockfile_strategy, LockfileStrategy::None) {
     if let Some(ref pm) = detected_pm {
-      if lockfile::has_lockfile_changed(&changed_files, pm) {
+      // Reuse the single `lockfile_changed` computed above rather than
+      // recomputing on the (post-negation) filtered set. This guarantees the
+      // exemption gate and the analysis agree on whether the lockfile changed —
+      // if they diverged, a lockfile could be dropped from global triggers yet
+      // skipped here, silently under-including (all -> 0).
+      if lockfile_changed {
         debug!("Lockfile changed, strategy: {:?}", config.lockfile_strategy);
         match lockfile::find_affected_dependencies(&config.cwd, &merge_base, pm) {
           Ok(affected_deps) if !affected_deps.is_empty() => {
@@ -872,22 +964,99 @@ fn process_changed_symbol(
   Ok(())
 }
 
+/// Whether an Nx `implicitDependencies` entry should be treated as a glob
+/// (matched against known project **names**, not paths).
+fn is_implicit_dep_glob(pattern: &str) -> bool {
+  let pat = pattern.strip_prefix('!').unwrap_or(pattern);
+  pat.contains('*') || pat.contains('?') || pat.contains('[')
+}
+
+/// Expand Nx-style `implicitDependencies` entries against known project names.
+///
+/// - Literals are kept as-is (even if no project with that name exists).
+/// - Globs (`*`, `?`, `[…]`) are matched against project names only.
+/// - Entries starting with `!` exclude matching names (Nx / minimatch style).
+fn expand_implicit_dependencies(patterns: &[String], project_names: &[String]) -> Vec<String> {
+  let mut includes: Vec<String> = Vec::new();
+  let mut exclude_globs: Vec<glob::Pattern> = Vec::new();
+  let mut exclude_literals: FxHashSet<String> = FxHashSet::default();
+
+  for pattern in patterns {
+    if let Some(negated) = pattern.strip_prefix('!') {
+      if negated.is_empty() {
+        continue;
+      }
+      if is_implicit_dep_glob(negated) {
+        match glob::Pattern::new(negated) {
+          Ok(p) => exclude_globs.push(p),
+          Err(e) => {
+            debug!(
+              "Ignoring invalid implicitDependencies exclude glob '{}': {}",
+              negated, e
+            );
+          }
+        }
+      } else {
+        exclude_literals.insert(negated.to_string());
+      }
+      continue;
+    }
+
+    if is_implicit_dep_glob(pattern) {
+      match glob::Pattern::new(pattern) {
+        Ok(glob_pat) => {
+          for name in project_names {
+            if glob_pat.matches(name) {
+              includes.push(name.clone());
+            }
+          }
+        }
+        Err(e) => {
+          debug!(
+            "Ignoring invalid implicitDependencies glob '{}': {}",
+            pattern, e
+          );
+        }
+      }
+    } else {
+      includes.push(pattern.clone());
+    }
+  }
+
+  let mut result: Vec<String> = includes
+    .into_iter()
+    .filter(|name| {
+      if exclude_literals.contains(name) {
+        return false;
+      }
+      !exclude_globs.iter().any(|p| p.matches(name))
+    })
+    .collect();
+  result.sort();
+  result.dedup();
+  result
+}
+
 fn add_implicit_dependencies(
   projects: &[Project],
   affected_packages: &mut FxHashSet<String>,
   mut project_causes: Option<&mut FxHashMap<String, Vec<AffectCause>>>,
 ) {
-  // Build a map of package -> implicit dependents
-  let mut implicit_dep_map: HashMap<String, Vec<String>> = HashMap::new();
+  // Build a map of package -> implicit dependents.
+  // Expand Nx-style globs against known project names up front so lookups stay O(1).
+  let project_names: Vec<String> = projects.iter().map(|p| p.name.clone()).collect();
+  let mut implicit_dep_map: FxHashMap<String, Vec<String>> = FxHashMap::default();
 
   for project in projects {
-    if !project.implicit_dependencies.is_empty() {
-      for dep in &project.implicit_dependencies {
-        implicit_dep_map
-          .entry(dep.clone())
-          .or_default()
-          .push(project.name.clone());
-      }
+    if project.implicit_dependencies.is_empty() {
+      continue;
+    }
+    let deps = expand_implicit_dependencies(&project.implicit_dependencies, &project_names);
+    for dep in deps {
+      implicit_dep_map
+        .entry(dep)
+        .or_default()
+        .push(project.name.clone());
     }
   }
 
@@ -919,33 +1088,26 @@ mod tests {
   use super::*;
   use std::path::PathBuf;
 
+  fn project(name: &str, implicit_dependencies: Vec<&str>) -> Project {
+    Project {
+      name: name.to_string(),
+      root: PathBuf::from(format!("libs/{name}")),
+      source_root: PathBuf::from(format!("libs/{name}")),
+      ts_config: None,
+      implicit_dependencies: implicit_dependencies
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+      targets: vec![],
+    }
+  }
+
   #[test]
   fn test_add_implicit_dependencies() {
     let projects = vec![
-      Project {
-        name: "app".to_string(),
-        root: PathBuf::from("apps/app"),
-        source_root: PathBuf::from("apps/app"),
-        ts_config: None,
-        implicit_dependencies: vec!["lib1".to_string(), "lib2".to_string()],
-        targets: vec![],
-      },
-      Project {
-        name: "lib1".to_string(),
-        root: PathBuf::from("libs/lib1"),
-        source_root: PathBuf::from("libs/lib1"),
-        ts_config: None,
-        implicit_dependencies: vec![],
-        targets: vec![],
-      },
-      Project {
-        name: "lib2".to_string(),
-        root: PathBuf::from("libs/lib2"),
-        source_root: PathBuf::from("libs/lib2"),
-        ts_config: None,
-        implicit_dependencies: vec![],
-        targets: vec![],
-      },
+      project("app", vec!["lib1", "lib2"]),
+      project("lib1", vec![]),
+      project("lib2", vec![]),
     ];
 
     let mut affected = FxHashSet::default();
@@ -955,5 +1117,61 @@ mod tests {
 
     assert!(affected.contains("lib1"));
     assert!(affected.contains("app")); // Should be added as implicit dependent
+  }
+
+  #[test]
+  fn test_add_implicit_dependencies_expands_globs() {
+    let projects = vec![
+      project("probe", vec!["lib-a", "integration-*-module"]),
+      project("lib-a", vec![]),
+      project("integration-foo-module", vec![]),
+      project("integration-bar-module", vec![]),
+      project("unrelated", vec![]),
+    ];
+
+    // Glob match: changing integration-foo-module should select probe
+    let mut affected = FxHashSet::default();
+    affected.insert("integration-foo-module".to_string());
+    add_implicit_dependencies(&projects, &mut affected, None);
+    assert!(affected.contains("probe"));
+    assert!(!affected.contains("unrelated"));
+
+    // Literal match still works
+    let mut affected_literal = FxHashSet::default();
+    affected_literal.insert("lib-a".to_string());
+    add_implicit_dependencies(&projects, &mut affected_literal, None);
+    assert!(affected_literal.contains("probe"));
+
+    // Non-matching name does not select probe
+    let mut affected_unrelated = FxHashSet::default();
+    affected_unrelated.insert("unrelated".to_string());
+    add_implicit_dependencies(&projects, &mut affected_unrelated, None);
+    assert!(!affected_unrelated.contains("probe"));
+  }
+
+  #[test]
+  fn test_expand_implicit_dependencies_supports_negation() {
+    let names = vec![
+      "pkg-a".to_string(),
+      "pkg-b".to_string(),
+      "other".to_string(),
+    ];
+    let expanded =
+      expand_implicit_dependencies(&["pkg-*".to_string(), "!pkg-b".to_string()], &names);
+    assert_eq!(expanded, vec!["pkg-a".to_string()]);
+  }
+
+  #[test]
+  fn test_expand_implicit_dependencies_deduplicates_overlapping_matches() {
+    let names = vec!["app-a".to_string(), "app-b".to_string()];
+    let expanded = expand_implicit_dependencies(
+      &[
+        "app-*".to_string(),
+        "app-a".to_string(),
+        "app-*".to_string(),
+      ],
+      &names,
+    );
+    assert_eq!(expanded, vec!["app-a".to_string(), "app-b".to_string()]);
   }
 }

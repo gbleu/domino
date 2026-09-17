@@ -5,10 +5,12 @@ use std::path::{Path, PathBuf};
 use tracing::debug;
 
 /// Extensions considered as source files (analyzed by Oxc parser).
-/// Includes the explicit ESM/CJS TypeScript & JavaScript extensions
-/// (`.mts`/`.mjs`/`.cts`/`.cjs`) — without these, files using them are
-/// misclassified as assets and skip semantic analysis entirely.
-const SOURCE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mts", "mjs", "cts", "cjs"];
+///
+/// Includes the explicit ESM/CJS variants (`.mts`/`.cts`/`.mjs`/`.cjs`) used by
+/// strict-ESM monorepos and dual-package (ESM+CJS) libraries. `Path::extension()`
+/// only returns the final segment, so this list also covers `.d.mts`/`.d.cts`
+/// (which report as `mts`/`cts`) without needing separate entries.
+const SOURCE_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 
 /// Check if a file is a source file (TypeScript/JavaScript)
 /// These are files that can be parsed by the Oxc parser
@@ -233,10 +235,13 @@ mod tests {
     assert!(is_source_file(Path::new("utils.js")));
     assert!(is_source_file(Path::new("app.jsx")));
     assert!(is_source_file(Path::new("path/to/file.ts")));
-    assert!(is_source_file(Path::new("contract.mts")));
-    assert!(is_source_file(Path::new("worker.mjs")));
-    assert!(is_source_file(Path::new("legacy.cts")));
-    assert!(is_source_file(Path::new("legacy.cjs")));
+
+    // ESM/CJS explicit-extension source files (strict-ESM monorepos, dual-package libs)
+    assert!(is_source_file(Path::new("utils.mts")));
+    assert!(is_source_file(Path::new("utils.cts")));
+    assert!(is_source_file(Path::new("utils.mjs")));
+    assert!(is_source_file(Path::new("utils.cjs")));
+    assert!(is_source_file(Path::new("path/to/file.mts")));
 
     // Non-source files
     assert!(!is_source_file(Path::new("styles.css")));

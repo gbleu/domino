@@ -21,24 +21,111 @@ use std::time::Instant;
 use tracing::{debug, warn};
 use walkdir::WalkDir;
 
-/// Type alias for import index entries: (importing_file, local_name, from_module)
-/// (importing_file, local_name, from_module, is_dynamic)
-type ImportIndexEntry = Vec<(PathBuf, String, String, bool)>;
+/// Type alias for a single import index value: (importing_file, local_name, from_module, is_dynamic)
+type ImportIndexValue = (PathBuf, String, String, bool);
+/// Type alias for import index entries: a list of values for a given (source_file, symbol_name) key
+type ImportIndexEntry = Vec<ImportIndexValue>;
 /// Type alias for the import index map: (source_file, symbol_name) -> entries
 type ImportIndexMap = FxHashMap<(PathBuf, String), ImportIndexEntry>;
+/// Type alias for reverse re-export index entries: (reexporting_file, export)
+type ReexportIndexEntry = Vec<(PathBuf, Export)>;
+/// Type alias for the reverse re-export index map: resolved_source_file -> entries
+type ReexportIndexMap = FxHashMap<PathBuf, ReexportIndexEntry>;
 
-/// Semantic data for a single file
+/// Semantic data for a single file.
 ///
-/// SAFETY INVARIANT: each instance exclusively owns its `allocator` and all
-/// memory referenced by `semantic`. The `Semantic<'static>` lifetime is
-/// produced via transmute and is only valid as long as the co-located
-/// `allocator` is alive. Do not introduce shared allocators, string interners,
-/// or any cross-file aliasing of the data held here.
+/// # Safety invariant
+///
+/// `semantic` is a [`oxc_semantic::Semantic<'static>`] obtained by transmuting a
+/// shorter, real lifetime. That `'static` is a lie, and it borrows from **two**
+/// owned fields co-located in this struct:
+///
+/// * `allocator` — the arena that owns every AST node `semantic` points at, and
+/// * `source` — the `String` whose heap buffer backs `Semantic::source_text`
+///   (`&'a str`) plus every `Atom<'a>` the parser sliced out of its input.
+///
+/// So the invariant is: `semantic` is only valid while **both** `allocator` and
+/// `source` are alive and have not been moved out of. Moving the struct as a
+/// whole is fine — the arena chunks and the `String`'s buffer are separate heap
+/// allocations whose addresses do not change when their owners move. What is
+/// *not* fine is separating the three fields: dropping (or reassigning) either
+/// `allocator` or `source` while keeping `semantic` is a use-after-free.
+///
+/// Dropping the whole value is safe in any field order: `Semantic` has no custom
+/// `Drop`, and its `'a`-parameterized fields (`source_text: &'a str`,
+/// `AstNodes<'a>`, …) are all borrows whose drop glue never dereferences the
+/// pointee. What must never happen is the three fields being *split apart*.
+///
+/// To make that compiler-enforced instead of merely conventional, all three
+/// fields are **private** and reachable only through the borrowing accessors
+/// [`FileSemanticData::semantic`] and [`FileSemanticData::source`]. To keep it
+/// that way: never expose a field by value, never add a public constructor that
+/// accepts pre-built parts, never derive `Clone` or `Default` (a derived `Clone`
+/// would duplicate `source`/`allocator` while the clone's `semantic` kept
+/// pointing at the *original's* memory, reopening exactly this hole), and do not
+/// introduce shared allocators, string interners, or any cross-file aliasing of
+/// the data held here.
+///
+/// Because the fields are private, the unsound "destructure and let the
+/// allocator drop" pattern no longer compiles outside this module (expected
+/// error: `E0451`, field is private).
+///
+/// Note: verify this guard with `cargo test --doc --no-default-features`. The
+/// `E0451` code above is documentation only — rustdoc does not enforce it on
+/// stable. And should the encapsulation ever regress so that this snippet
+/// compiles again, the default `napi-bindings` feature would hide the
+/// regression: the doctest binary cannot link the host-provided `napi_*`
+/// symbols, and rustdoc counts that link failure as the expected compile
+/// failure, so the test would pass vacuously. Without the feature, rustdoc
+/// correctly reports "Test compiled successfully, but it's marked
+/// `compile_fail`".
+///
+/// ```compile_fail,E0451
+/// use domino::semantic::analyzer::FileSemanticData;
+/// use oxc_semantic::Semantic;
+///
+/// // Would drop `allocator` and `source` while keeping `semantic` alive.
+/// fn escape(data: FileSemanticData) -> Semantic<'static> {
+///   let FileSemanticData { semantic, .. } = data;
+///   semantic
+/// }
+/// ```
+///
+/// Borrowing through the accessors is what callers should do instead — the
+/// returned references cannot outlive the owner:
+///
+/// ```no_run
+/// use domino::semantic::analyzer::FileSemanticData;
+///
+/// fn describe(data: &FileSemanticData) -> (usize, usize) {
+///   (
+///     data.source().len(),
+///     data.semantic().scoping().symbol_ids().count(),
+///   )
+/// }
+/// ```
 pub struct FileSemanticData {
-  pub source: String,
+  source: String,
   #[allow(dead_code)]
-  pub allocator: Allocator,
-  pub semantic: oxc_semantic::Semantic<'static>,
+  allocator: Allocator,
+  semantic: oxc_semantic::Semantic<'static>,
+}
+
+impl FileSemanticData {
+  /// The file's source text.
+  pub fn source(&self) -> &str {
+    &self.source
+  }
+
+  /// The file's semantic model.
+  ///
+  /// The returned reference is deliberately `&Semantic<'_>` rather than
+  /// `&Semantic<'static>`: the inner lifetime is re-tied to the borrow of
+  /// `self`, so callers cannot launder the transmuted `'static` out of this
+  /// struct and hold AST references past the owner's drop.
+  pub fn semantic(&self) -> &oxc_semantic::Semantic<'_> {
+    &self.semantic
+  }
 }
 
 /// Wrapper for parallel parsing results that need to be sent across threads.
@@ -73,11 +160,16 @@ pub struct WorkspaceAnalyzer {
   /// This index maps from a file+symbol to all the places that import it
   /// The from_module is kept for re-export checking
   pub import_index: ImportIndexMap,
-  /// tsconfig.base.json path alias keys (e.g. `@scope/my-lib`).
-  /// Used alongside project names for the `is_workspace_specifier` check because
-  /// Nx project names can differ from the npm package names / tsconfig aliases
-  /// that code actually imports.
-  pub tsconfig_path_prefixes: Vec<String>,
+  /// Reverse re-export index: resolved_source_file -> [(reexporting_file, export)]
+  ///
+  /// Answers "which barrel files re-export from this file?" in O(1). Built once at
+  /// construction time with the same resolver/normalization as `import_index`, so the
+  /// keys are workspace-relative paths (see `ReferenceFinder::normalize_path`).
+  /// Without this index, every reference lookup had to scan the exports of every file
+  /// in the workspace and resolve each re-export specifier.
+  pub reexport_index: ReexportIndexMap,
+  /// Resolver shared by the import index, the re-export index and `ReferenceFinder`
+  pub(crate) resolver: super::WorkspaceResolver,
   /// Profiler for performance measurement
   pub profiler: Arc<Profiler>,
 }
@@ -85,7 +177,11 @@ pub struct WorkspaceAnalyzer {
 impl WorkspaceAnalyzer {
   /// Create a new workspace analyzer
   pub fn new(projects: Vec<Project>, cwd: &Path, profiler: Arc<Profiler>) -> Result<Self> {
-    let tsconfig_path_prefixes = super::parse_tsconfig_path_prefixes(cwd);
+    let resolver = super::WorkspaceResolver::new(
+      cwd,
+      projects.clone(),
+      super::parse_tsconfig_path_prefixes(cwd),
+    );
 
     let mut analyzer = Self {
       files: HashMap::new(),
@@ -93,73 +189,126 @@ impl WorkspaceAnalyzer {
       exports: HashMap::new(),
       projects,
       import_index: FxHashMap::default(),
-      tsconfig_path_prefixes,
+      reexport_index: FxHashMap::default(),
+      resolver,
       profiler,
     };
 
     analyzer.analyze_workspace(cwd)?;
 
     // Build import index
-    analyzer.build_import_index(cwd)?;
+    analyzer.build_import_index()?;
+
+    // Build reverse re-export index (barrel files)
+    analyzer.build_reexport_index()?;
 
     Ok(analyzer)
   }
 
+  /// Build the reverse re-export index: resolved_source_file -> [(reexporting_file, export)]
+  ///
+  /// This is the mirror image of `build_import_index`: instead of "who imports this
+  /// symbol", it answers "which files re-export from this file" (barrel files such as
+  /// `index.ts`). Must be called after `analyze_workspace`.
+  fn build_reexport_index(&mut self) -> Result<()> {
+    let mut index: ReexportIndexMap = FxHashMap::default();
+
+    for (reexporting_file, file_exports) in &self.exports {
+      for export in file_exports {
+        let Some(from_module) = export.re_export_from.as_deref() else {
+          continue;
+        };
+
+        let Some(resolved) = self.resolver.resolve(reexporting_file, from_module) else {
+          continue;
+        };
+
+        index
+          .entry(resolved)
+          .or_default()
+          .push((reexporting_file.clone(), export.clone()));
+      }
+    }
+
+    debug!(
+      "Built re-export index with {} source files re-exported from elsewhere",
+      index.len()
+    );
+    self.reexport_index = index;
+
+    Ok(())
+  }
+
   /// Build reverse import index: (source_file, symbol) -> [(importing_file, local_name, from_module)]
   /// This must be called after analyze_workspace and needs a resolver
-  fn build_import_index(&mut self, cwd: &Path) -> Result<()> {
-    use oxc_resolver::Resolver;
+  ///
+  /// Resolution (the expensive part — real filesystem work via `oxc_resolver`:
+  /// stats, package.json/tsconfig lookups) is parallelized with rayon, mirroring
+  /// the parsing phase in `analyze_workspace`. A single shared `Resolver` is used
+  /// for all items: its cache uses concurrent maps and atomics internally, so
+  /// it is `Send + Sync` (compiler-enforced here, since the closure captures
+  /// `&Resolver`) and safe to share by reference across threads — this is the
+  /// same resolver Rolldown uses multi-threaded. Constructing one `Resolver`
+  /// per item would be wasteful,
+  /// since construction itself is not free.
+  fn build_import_index(&mut self) -> Result<()> {
+    // Borrow only the resolver field so the closure captures a shared (`Sync`)
+    // reference, never `self` as a whole, which keeps this compatible with the
+    // `&mut self` receiver.
+    let resolver = &self.resolver;
 
-    let resolver = Resolver::new(super::create_resolve_options(cwd, &self.projects));
-    use tracing::debug;
+    // Flatten to a list of (importing_file, import) work items.
+    let work_items: Vec<(&PathBuf, &Import)> = self
+      .imports
+      .iter()
+      .flat_map(|(importing_file, file_imports)| {
+        file_imports
+          .iter()
+          .map(move |import| (importing_file, import))
+      })
+      .collect();
 
-    let mut index: ImportIndexMap = FxHashMap::default();
+    // Resolve every import in parallel. Each item independently produces at
+    // most one `(key, value)` index entry, or `None` if the import is
+    // external / unresolved — preserving the exact skip/fallback semantics of
+    // the original sequential loop.
+    //
+    // NOTE: We intentionally do NOT skip type-only imports. Even though they
+    // don't exist at runtime, they represent semantic dependencies — if a
+    // type changes, files that import it need to be re-type-checked.
+    let resolved_entries: Vec<((PathBuf, String), ImportIndexValue)> = work_items
+      .into_par_iter()
+      .filter_map(|(importing_file, import)| {
+        let resolved = resolver.resolve(importing_file, &import.from_module)?;
 
-    // For each file and its imports
-    for (importing_file, file_imports) in &self.imports {
-      for import in file_imports {
-        // NOTE: We intentionally do NOT skip type-only imports
-        // Even though they don't exist at runtime, they represent semantic dependencies
-        // If a type changes, files that import it need to be re-type-checked
-
-        // Resolve where this import comes from
-        let from_path = cwd.join(importing_file);
-        let context = match from_path.parent() {
-          Some(ctx) => ctx,
-          None => continue,
-        };
-
-        if !super::is_workspace_specifier(
-          &import.from_module,
-          &self.projects,
-          &self.tsconfig_path_prefixes,
-        ) {
-          continue;
-        }
-
-        let resolved = match resolver.resolve(context, &import.from_module) {
-          Ok(resolution) => {
-            let resolved = resolution.path();
-            match resolved.strip_prefix(cwd) {
-              Ok(p) => p.to_path_buf(),
-              Err(_) => continue,
-            }
-          }
-          Err(_) => match super::simple_resolve_relative(cwd, context, &import.from_module) {
-            Some(p) => p,
-            None => continue,
-          },
-        };
-
-        // Add to index: (resolved_file, imported_symbol) -> (importing_file, local_name, from_module, is_dynamic)
+        // (resolved_file, imported_symbol) -> (importing_file, local_name, from_module, is_dynamic)
         let key = (resolved, import.imported_name.clone());
-        index.entry(key).or_default().push((
+        let value = (
           importing_file.clone(),
           import.local_name.clone(),
           import.from_module.clone(),
           import.is_dynamic,
-        ));
-      }
+        );
+        Some((key, value))
+      })
+      .collect();
+
+    // Merge sequentially — cheap relative to the parallel resolution work
+    // above — into the final index map.
+    let mut index: ImportIndexMap = FxHashMap::default();
+    for (key, value) in resolved_entries {
+      index.entry(key).or_default().push(value);
+    }
+
+    // Rayon's collect preserves work-item order, but `self.imports` is a
+    // std HashMap whose iteration order varies run to run, and
+    // nothing downstream depends on importer order within a value (the final
+    // affected-projects list is sorted independently in core.rs). Sort each
+    // entry list anyway so the index — and any debug output derived from it —
+    // is deterministic and reproducible across runs, rather than depending on
+    // thread-scheduling order.
+    for entries in index.values_mut() {
+      entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     }
 
     let unique_symbols = index
@@ -238,8 +387,6 @@ impl WorkspaceAnalyzer {
         e.map_err(|err| warn!("Failed to read directory entry: {}", err))
           .ok()
       })
-      // Reuse the shared source-file predicate (single source of truth for the
-      // extension set) so the walk can't drift from `SOURCE_EXTENSIONS`.
       .filter(|e| e.file_type().is_file() && crate::utils::is_source_file(e.path()))
       .map(|e| {
         let abs_path = e.into_path();
@@ -274,11 +421,20 @@ impl WorkspaceAnalyzer {
       // Continue anyway — partial AST may still be useful
     }
 
+    // Move the `Program` into the arena before building semantic data. The AST
+    // root that `Parser::parse` returns lives in this function's stack frame,
+    // and `SemanticBuilder` records it as the root `AstKind::Program` node — so
+    // building from `&parse_result.program` leaves the returned `Semantic`
+    // holding a reference into a frame that dies on return. Once the stack is
+    // reused, the Program node reads back a garbage span (typically `0..0`),
+    // which silently breaks symbol resolution at the top of a file.
+    let program = &*allocator.alloc(parse_result.program);
+
     let semantic_builder = SemanticBuilder::new()
       .with_cfg(true)
       .with_check_syntax_error(false);
 
-    let semantic_ret = semantic_builder.build(&parse_result.program);
+    let semantic_ret = semantic_builder.build(program);
 
     if !semantic_ret.errors.is_empty() {
       debug!(
@@ -288,11 +444,14 @@ impl WorkspaceAnalyzer {
       );
     }
 
-    let imports = Self::extract_imports(&parse_result.program, &relative_path);
-    let exports = Self::extract_exports(&parse_result.program);
+    let imports = Self::extract_imports(program, &relative_path);
+    let exports = Self::extract_exports(program);
 
-    // Safety: We're storing the semantic data with its allocator, which is valid
-    // as long as the FileSemanticData struct exists
+    // SAFETY: `semantic_ret.semantic` borrows only from `allocator` (AST nodes)
+    // and from `source` (source text and atoms). Both are moved into the
+    // `FileSemanticData` built below, where they live exactly as long as the
+    // semantic data does and are never handed back out by value. See the safety
+    // invariant on [`FileSemanticData`].
     let semantic = unsafe {
       std::mem::transmute::<oxc_semantic::Semantic<'_>, oxc_semantic::Semantic<'static>>(
         semantic_ret.semantic,
@@ -308,6 +467,55 @@ impl WorkspaceAnalyzer {
       },
       imports,
       exports,
+    })
+  }
+
+  /// Parse an in-memory `source` string into a self-contained
+  /// [`FileSemanticData`], picking the source type from `file_path`'s
+  /// extension. Unlike [`parse_single_file`], this reads no file from disk and
+  /// skips import/export extraction — it exists to run [`find_top_level_symbols`]
+  /// against a base-revision snapshot of deleted code, which is never added to
+  /// `self.files`.
+  fn parse_source(file_path: &Path, source: String) -> Result<FileSemanticData> {
+    let source_type = SourceType::from_path(file_path)
+      .unwrap_or_else(|_| SourceType::default().with_typescript(true));
+
+    let allocator = Allocator::default();
+    let parser = Parser::new(&allocator, &source, source_type);
+    let parse_result = parser.parse();
+
+    if !parse_result.errors.is_empty() {
+      debug!(
+        "Parse errors in base revision of {:?}: {} errors",
+        file_path,
+        parse_result.errors.len()
+      );
+      // Continue anyway — a partial AST is still enough to resolve the
+      // enclosing declaration at a deleted line.
+    }
+
+    // Arena-allocate the AST root for the same reason as `parse_single_file`:
+    // otherwise the root Program node dangles into this frame after return.
+    let program = &*allocator.alloc(parse_result.program);
+
+    let semantic_ret = SemanticBuilder::new()
+      .with_cfg(true)
+      .with_check_syntax_error(false)
+      .build(program);
+
+    // SAFETY: identical to `parse_single_file` — the semantic data borrows only
+    // from `allocator` and `source`, both of which are moved into the returned
+    // `FileSemanticData` and live exactly as long as the semantic data does.
+    let semantic = unsafe {
+      std::mem::transmute::<oxc_semantic::Semantic<'_>, oxc_semantic::Semantic<'static>>(
+        semantic_ret.semantic,
+      )
+    };
+
+    Ok(FileSemanticData {
+      source,
+      allocator,
+      semantic,
     })
   }
 }
@@ -563,14 +771,14 @@ impl WorkspaceAnalyzer {
     let mut references = Vec::new();
 
     // Iterate through all symbols in the file
-    for symbol_id in file_data.semantic.scoping().symbol_ids() {
-      let name = file_data.semantic.scoping().symbol_name(symbol_id);
+    for symbol_id in file_data.semantic().scoping().symbol_ids() {
+      let name = file_data.semantic().scoping().symbol_name(symbol_id);
 
       if name == symbol_name {
         // Get all references to this symbol using the Semantic API directly
-        for reference in file_data.semantic.symbol_references(symbol_id) {
-          let span = file_data.semantic.reference_span(reference);
-          let (line, column) = self.span_to_line_col(&file_data.source, span);
+        for reference in file_data.semantic().symbol_references(symbol_id) {
+          let span = file_data.semantic().reference_span(reference);
+          let (line, column) = self.span_to_line_col(file_data.source(), span);
 
           references.push(Reference {
             file_path: file_path.to_path_buf(),
@@ -611,7 +819,7 @@ impl WorkspaceAnalyzer {
 
     let mut references = Vec::new();
 
-    for node in file_data.semantic.nodes().iter() {
+    for node in file_data.semantic().nodes().iter() {
       match node.kind() {
         AstKind::StaticMemberExpression(member_expr)
           if member_expr.property.name.as_str() == property_name =>
@@ -619,7 +827,7 @@ impl WorkspaceAnalyzer {
           if let Expression::Identifier(ident) = &member_expr.object {
             if ident.name.as_str() == namespace_name {
               let span = member_expr.span;
-              let (line, column) = self.span_to_line_col(&file_data.source, span);
+              let (line, column) = self.span_to_line_col(file_data.source(), span);
               references.push(Reference {
                 file_path: file_path.to_path_buf(),
                 line,
@@ -634,7 +842,7 @@ impl WorkspaceAnalyzer {
           if let oxc_ast::ast::TSTypeName::IdentifierReference(ident) = &qualified_name.left {
             if ident.name.as_str() == namespace_name {
               let span = qualified_name.span;
-              let (line, column) = self.span_to_line_col(&file_data.source, span);
+              let (line, column) = self.span_to_line_col(file_data.source(), span);
               references.push(Reference {
                 file_path: file_path.to_path_buf(),
                 line,
@@ -806,12 +1014,34 @@ impl WorkspaceAnalyzer {
       .get(file_path)
       .ok_or_else(|| DominoError::FileNotFound(file_path.display().to_string()))?;
 
+    let result = Self::find_top_level_symbols(file_data, line, column);
+
+    if let Some(start_time) = start {
+      self
+        .profiler
+        .record_symbol_extraction(start_time.elapsed().as_nanos() as u64);
+    }
+
+    result
+  }
+
+  /// Resolve the enclosing top-level symbol(s) at `line`/`column` within an
+  /// already-parsed file. Shared by [`WorkspaceAnalyzer::find_node_at_line`]
+  /// (working-tree files) and [`WorkspaceAnalyzer::find_deleted_symbols`]
+  /// (base-revision snapshots of deleted code). Takes `&FileSemanticData`
+  /// rather than `&self` so it can run against a one-off parse that never
+  /// enters `self.files`.
+  fn find_top_level_symbols(
+    file_data: &FileSemanticData,
+    line: usize,
+    column: usize,
+  ) -> Result<Vec<String>> {
     // Get the exact offset using both line and column
-    let line_start = crate::utils::line_to_offset(&file_data.source, line)
+    let line_start = crate::utils::line_to_offset(file_data.source(), line)
       .ok_or_else(|| DominoError::Other(format!("Invalid line number: {}", line)))?;
     let exact_offset = line_start + column;
-    let line_end =
-      crate::utils::line_to_offset(&file_data.source, line + 1).unwrap_or(file_data.source.len());
+    let line_end = crate::utils::line_to_offset(file_data.source(), line + 1)
+      .unwrap_or(file_data.source().len());
     let line_end_inclusive = line_end.saturating_sub(1);
 
     let specifier_names_on_line = |export_decl: &ExportNamedDeclaration| -> Vec<String> {
@@ -832,7 +1062,7 @@ impl WorkspaceAnalyzer {
     };
 
     // Find nodes at this position
-    let nodes = file_data.semantic.nodes();
+    let nodes = file_data.semantic().nodes();
 
     // First pass: Find the SMALLEST node that CONTAINS this exact position
     // Using the exact offset (line + column) allows us to pinpoint the specific node
@@ -900,12 +1130,6 @@ impl WorkspaceAnalyzer {
         if top_level_name.is_none() && !export_decl.specifiers.is_empty() {
           let specifier_names = specifier_names_on_line(export_decl);
           if !specifier_names.is_empty() {
-            // Record profiling time
-            if let Some(start_time) = start {
-              self
-                .profiler
-                .record_symbol_extraction(start_time.elapsed().as_nanos() as u64);
-            }
             return Ok(specifier_names);
           }
         }
@@ -928,12 +1152,6 @@ impl WorkspaceAnalyzer {
     // If we found the symbol at the current node level, return it early
     if found_export_wrapper {
       if let Some(name) = top_level_name.take() {
-        // Record profiling time
-        if let Some(start_time) = start {
-          self
-            .profiler
-            .record_symbol_extraction(start_time.elapsed().as_nanos() as u64);
-        }
         return Ok(vec![name]);
       }
     }
@@ -958,12 +1176,6 @@ impl WorkspaceAnalyzer {
           if top_level_name.is_none() && !export_decl.specifiers.is_empty() {
             let specifier_names = specifier_names_on_line(export_decl);
             if !specifier_names.is_empty() {
-              // Record profiling time
-              if let Some(start_time) = start {
-                self
-                  .profiler
-                  .record_symbol_extraction(start_time.elapsed().as_nanos() as u64);
-              }
               return Ok(specifier_names);
             }
           }
@@ -1017,17 +1229,66 @@ impl WorkspaceAnalyzer {
       current_id = parent_id;
     }
 
-    // Record profiling time
-    if let Some(start_time) = start {
-      self
-        .profiler
-        .record_symbol_extraction(start_time.elapsed().as_nanos() as u64);
-    }
-
     // Return the top-level declaration if found, otherwise empty
     // When empty is returned, it means the line doesn't contain a trackable symbol
     // (e.g., object literal properties, comments, or code not in a top-level declaration)
     Ok(top_level_name.map(|name| vec![name]).unwrap_or_default())
+  }
+
+  /// Recover the top-level symbols that enclosed a set of *base-revision* lines.
+  ///
+  /// When a change is a pure deletion (`@@ -X,Y +Z,0 @@`), the removed lines no
+  /// longer exist in the working tree, so [`WorkspaceAnalyzer::find_node_at_line`]
+  /// on the current file cannot recover the affected symbol. This parses a
+  /// snapshot of the file as it existed at the base revision and runs the same
+  /// top-level-symbol resolution against the old-side line numbers. It therefore
+  /// handles both shapes of deletion:
+  ///
+  /// - removing a member of a still-present declaration (an object property, a
+  ///   `switch` case) resolves to the enclosing symbol, and
+  /// - removing an entire top-level declaration resolves to that declaration
+  ///   itself.
+  ///
+  /// The returned names are then traced through the *current* import graph —
+  /// consumers still `import { Foo }` from the file even after `Foo` is deleted,
+  /// so their projects are correctly reported affected. Returns de-duplicated
+  /// names, preserving first-seen order; an empty vec if the snapshot fails to
+  /// parse or no line resolves to a symbol.
+  pub fn find_deleted_symbols(
+    &self,
+    file_path: &Path,
+    base_source: &str,
+    deleted_lines: &[usize],
+  ) -> Vec<String> {
+    if deleted_lines.is_empty() {
+      return Vec::new();
+    }
+
+    let file_data = match Self::parse_source(file_path, base_source.to_string()) {
+      Ok(data) => data,
+      Err(e) => {
+        debug!("Failed to parse base revision of {:?}: {}", file_path, e);
+        return Vec::new();
+      }
+    };
+
+    let mut symbols: Vec<String> = Vec::new();
+    for &line in deleted_lines {
+      match Self::find_top_level_symbols(&file_data, line, 0) {
+        Ok(names) => {
+          for name in names {
+            if !symbols.contains(&name) {
+              symbols.push(name);
+            }
+          }
+        }
+        Err(e) => debug!(
+          "Error resolving deleted symbol at base line {} in {:?}: {}",
+          line, file_path, e
+        ),
+      }
+    }
+    symbols
   }
 }
 
@@ -1035,6 +1296,59 @@ impl WorkspaceAnalyzer {
 mod tests {
   use super::*;
   use std::path::Path;
+
+  /// Overwrite the stack region that `parse_single_file`'s frame occupied, so
+  /// that a Program node still pointing into that frame reads back garbage
+  /// rather than stale-but-intact bytes. Without this the use-after-free is
+  /// invisible most of the time.
+  #[inline(never)]
+  fn clobber_stack() -> u8 {
+    let mut buf = [0xAAu8; 64 * 1024];
+    for (i, b) in buf.iter_mut().enumerate() {
+      *b = (i % 251) as u8;
+    }
+    buf[buf.len() - 1]
+  }
+
+  /// The AST root must live in the arena, not in the stack frame of whichever
+  /// function parsed the file. `SemanticBuilder` records the `Program` as the
+  /// root node, so if it is built from a stack local the node dangles once the
+  /// parsing function returns: the span reads back as `0..0`, which still
+  /// "contains" offset 0 and therefore wins the smallest-enclosing-node search
+  /// in `find_top_level_symbols`, silently yielding no symbol for anything on
+  /// line 1. That surfaced as intermittently missing affected projects.
+  #[test]
+  fn program_node_span_survives_parse_function_return() {
+    let source = "export const Widget = () => <div>modified</div>;\n";
+    let file_data =
+      WorkspaceAnalyzer::parse_source(Path::new("Widget.tsx"), source.to_string()).unwrap();
+
+    std::hint::black_box(clobber_stack());
+
+    let program_span = file_data
+      .semantic
+      .nodes()
+      .iter()
+      .find_map(|node| match node.kind() {
+        AstKind::Program(_) => Some(node.kind().span()),
+        _ => None,
+      })
+      .expect("semantic data should contain a Program node");
+
+    assert_eq!(
+      (program_span.start, program_span.end),
+      (0, source.len() as u32),
+      "Program node span was corrupted after the parsing function returned — \
+       the AST root is not arena-allocated"
+    );
+
+    let symbols = WorkspaceAnalyzer::find_top_level_symbols(&file_data, 1, 0).unwrap();
+    assert_eq!(
+      symbols,
+      vec!["Widget".to_string()],
+      "symbol on line 1 should resolve after the parsing function returned"
+    );
+  }
 
   #[test]
   fn test_find_node_at_line_with_column_offset() {
@@ -1230,6 +1544,53 @@ const [x, y] = [1, 2]"#;
     let result = analyzer.find_node_at_line(&file_path, 1, 0);
     assert!(result.is_ok());
     assert_eq!(result.unwrap(), vec!["a".to_string()]);
+  }
+
+  #[test]
+  fn test_find_deleted_symbols_whole_exported_declaration() {
+    // The base revision no longer needs to be in `analyzer.files`: deletion
+    // recovery parses the passed-in snapshot directly. Deleting the entire
+    // `Removed` const (base lines 1-3) must resolve to "Removed".
+    let base_source = r#"export const Removed = {
+  value: 1,
+};
+
+export const Kept = 2;
+"#;
+    let profiler = Arc::new(Profiler::new(false));
+    let analyzer =
+      WorkspaceAnalyzer::new(vec![], Path::new("."), profiler).expect("Failed to create analyzer");
+
+    let symbols = analyzer.find_deleted_symbols(Path::new("gone.ts"), base_source, &[1, 2, 3]);
+    assert_eq!(symbols, vec!["Removed".to_string()]);
+  }
+
+  #[test]
+  fn test_find_deleted_symbols_member_resolves_enclosing_symbol() {
+    // Deleting a member line (base line 3, `beta: 2,`) resolves to the enclosing
+    // top-level symbol `TABLE`, not the member itself — de-duplicated across the
+    // deleted lines.
+    let base_source = r#"export const TABLE = {
+  alpha: 1,
+  beta: 2,
+  gamma: 3,
+};
+"#;
+    let profiler = Arc::new(Profiler::new(false));
+    let analyzer =
+      WorkspaceAnalyzer::new(vec![], Path::new("."), profiler).expect("Failed to create analyzer");
+
+    let symbols = analyzer.find_deleted_symbols(Path::new("table.ts"), base_source, &[3]);
+    assert_eq!(symbols, vec!["TABLE".to_string()]);
+  }
+
+  #[test]
+  fn test_find_deleted_symbols_empty_lines_returns_empty() {
+    let profiler = Arc::new(Profiler::new(false));
+    let analyzer =
+      WorkspaceAnalyzer::new(vec![], Path::new("."), profiler).expect("Failed to create analyzer");
+    let symbols = analyzer.find_deleted_symbols(Path::new("x.ts"), "export const A = 1;\n", &[]);
+    assert!(symbols.is_empty());
   }
 
   #[test]
@@ -1889,5 +2250,291 @@ type Props = ui.ButtonProps;
       .find_node_at_line(&file_path, 1, 0)
       .expect("Should not error");
     assert_eq!(result, vec!["MyConst".to_string()]);
+  }
+
+  /// Build an analyzer over a real (temporary) workspace containing `files`,
+  /// with a single project rooted at `src`.
+  fn analyzer_over_files(files: &[(&str, &str)]) -> (tempfile::TempDir, WorkspaceAnalyzer) {
+    let tmp = tempfile::TempDir::new().expect("failed to create temp dir");
+    let cwd = tmp
+      .path()
+      .canonicalize()
+      .expect("failed to canonicalize temp dir");
+
+    for (rel, contents) in files {
+      let path = cwd.join(rel);
+      fs::create_dir_all(path.parent().unwrap()).unwrap();
+      fs::write(&path, contents).unwrap();
+    }
+
+    let project = Project {
+      name: "lib".to_string(),
+      root: PathBuf::from("src"),
+      source_root: PathBuf::from("src"),
+      ts_config: None,
+      implicit_dependencies: vec![],
+      targets: vec![],
+    };
+
+    let profiler = Arc::new(Profiler::new(false));
+    let analyzer = WorkspaceAnalyzer::new(vec![project], &cwd, profiler)
+      .expect("failed to create workspace analyzer");
+
+    (tmp, analyzer)
+  }
+
+  /// Sorted `(reexporting_file, exported_name, local_name)` triples for a source file.
+  fn reexporters_of(
+    analyzer: &WorkspaceAnalyzer,
+    source: &str,
+  ) -> Vec<(String, String, Option<String>)> {
+    let mut entries: Vec<_> = analyzer
+      .reexport_index
+      .get(Path::new(source))
+      .map(|v| v.as_slice())
+      .unwrap_or(&[])
+      .iter()
+      .map(|(file, export)| {
+        (
+          file.to_string_lossy().replace('\\', "/"),
+          export.exported_name.clone(),
+          export.local_name.clone(),
+        )
+      })
+      .collect();
+    entries.sort();
+    entries
+  }
+
+  #[test]
+  fn test_build_reexport_index_named_wildcard_and_aliased() {
+    let (_tmp, analyzer) = analyzer_over_files(&[
+      (
+        "src/utils.ts",
+        "export function helper() {\n  return 1;\n}\n",
+      ),
+      ("src/other.ts", "export const other = 2;\n"),
+      // Barrel: named re-export of utils, wildcard re-export of other
+      (
+        "src/index.ts",
+        "export { helper } from './utils';\nexport * from './other';\n",
+      ),
+      // Second barrel: aliased re-export, plus a re-export of the first barrel
+      (
+        "src/public-api.ts",
+        "export { helper as publicHelper } from './utils';\nexport * from './index';\n",
+      ),
+      // Plain import (not a re-export) must NOT land in the index
+      (
+        "src/consumer.ts",
+        "import { helper } from './utils';\nexport const used = helper();\n",
+      ),
+      // External re-export must NOT land in the index
+      (
+        "src/external.ts",
+        "export { something } from 'some-external-package';\n",
+      ),
+    ]);
+
+    // utils.ts is re-exported by index.ts (named) and public-api.ts (aliased)
+    assert_eq!(
+      reexporters_of(&analyzer, "src/utils.ts"),
+      vec![
+        (
+          "src/index.ts".to_string(),
+          "helper".to_string(),
+          Some("helper".to_string())
+        ),
+        (
+          "src/public-api.ts".to_string(),
+          "publicHelper".to_string(),
+          Some("helper".to_string())
+        ),
+      ],
+      "index: {:?}",
+      analyzer.reexport_index
+    );
+
+    // other.ts is re-exported by index.ts via a wildcard (exported_name == "*")
+    assert_eq!(
+      reexporters_of(&analyzer, "src/other.ts"),
+      vec![("src/index.ts".to_string(), "*".to_string(), None)]
+    );
+
+    // Barrel-of-barrel: index.ts is re-exported by public-api.ts
+    assert_eq!(
+      reexporters_of(&analyzer, "src/index.ts"),
+      vec![("src/public-api.ts".to_string(), "*".to_string(), None)]
+    );
+
+    // Files that are only imported (never re-exported) are absent
+    assert!(
+      !analyzer
+        .reexport_index
+        .contains_key(Path::new("src/consumer.ts")),
+      "consumer.ts is not re-exported by anyone"
+    );
+
+    // Unresolvable / external specifiers never create entries
+    assert!(
+      analyzer.reexport_index.keys().all(|k| k.starts_with("src")),
+      "index must only contain workspace-relative paths: {:?}",
+      analyzer.reexport_index.keys().collect::<Vec<_>>()
+    );
+  }
+
+  #[test]
+  fn test_build_reexport_index_keys_match_analyzer_paths() {
+    // The index keys must be the same workspace-relative paths used everywhere else
+    // (`exports` / `imports` / `import_index`), otherwise lookups silently miss.
+    let (_tmp, analyzer) = analyzer_over_files(&[
+      ("src/nested/deep/utils.ts", "export const value = 1;\n"),
+      (
+        "src/nested/index.ts",
+        "export { value } from './deep/utils';\n",
+      ),
+    ]);
+
+    let key = PathBuf::from("src/nested/deep/utils.ts");
+    assert!(
+      analyzer.exports.contains_key(&key),
+      "sanity: exports are keyed by workspace-relative paths"
+    );
+    assert!(
+      analyzer.reexport_index.contains_key(&key),
+      "re-export index must use the same keys as `exports`: {:?}",
+      analyzer.reexport_index.keys().collect::<Vec<_>>()
+    );
+  }
+
+  /// Characterization test for `build_import_index`: constructs a small real
+  /// on-disk workspace with several cross-project imports and asserts on the
+  /// resulting `import_index` contents directly. This is intentionally
+  /// written to pass against the sequential implementation first — it must
+  /// keep passing unchanged once `build_import_index` is parallelized with
+  /// rayon, since the map contents (not the internal resolution order) are
+  /// the actual contract.
+  #[test]
+  fn test_build_import_index_cross_project_imports() {
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().expect("Failed to create temp dir");
+    let cwd = tmp
+      .path()
+      .canonicalize()
+      .expect("Failed to canonicalize temp dir");
+
+    let lib_a_src = cwd.join("libs/lib-a/src");
+    let lib_b_src = cwd.join("libs/lib-b/src");
+    let app_src = cwd.join("apps/app/src");
+    fs::create_dir_all(&lib_a_src).unwrap();
+    fs::create_dir_all(&lib_b_src).unwrap();
+    fs::create_dir_all(&app_src).unwrap();
+
+    fs::write(
+      lib_a_src.join("index.ts"),
+      r#"export function helperA() {
+  return 'a';
+}
+
+export const CONST_A = 1;
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+      lib_b_src.join("index.ts"),
+      r#"import { helperA } from 'lib-a';
+
+export function helperB() {
+  return helperA();
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+      app_src.join("main.ts"),
+      r#"import { helperA } from 'lib-a';
+import { helperB } from 'lib-b';
+
+export function run() {
+  return helperA() + helperB();
+}
+"#,
+    )
+    .unwrap();
+
+    let projects = vec![
+      Project {
+        name: "lib-a".to_string(),
+        root: PathBuf::from("libs/lib-a"),
+        source_root: PathBuf::from("libs/lib-a/src"),
+        ts_config: None,
+        implicit_dependencies: vec![],
+        targets: vec![],
+      },
+      Project {
+        name: "lib-b".to_string(),
+        root: PathBuf::from("libs/lib-b"),
+        source_root: PathBuf::from("libs/lib-b/src"),
+        ts_config: None,
+        implicit_dependencies: vec![],
+        targets: vec![],
+      },
+      Project {
+        name: "app".to_string(),
+        root: PathBuf::from("apps/app"),
+        source_root: PathBuf::from("apps/app/src"),
+        ts_config: None,
+        implicit_dependencies: vec![],
+        targets: vec![],
+      },
+    ];
+
+    let profiler = Arc::new(Profiler::new(false));
+    let analyzer =
+      WorkspaceAnalyzer::new(projects, &cwd, profiler).expect("Failed to create analyzer");
+
+    let lib_a_index = PathBuf::from("libs/lib-a/src/index.ts");
+    let lib_b_index = PathBuf::from("libs/lib-b/src/index.ts");
+    let app_main = PathBuf::from("apps/app/src/main.ts");
+
+    // helperA is imported by both lib-b and app — the index must contain
+    // both importers, regardless of resolution/merge order.
+    let helper_a_key = (lib_a_index.clone(), "helperA".to_string());
+    let helper_a_importers = analyzer
+      .import_index
+      .get(&helper_a_key)
+      .unwrap_or_else(|| panic!("Expected import index entry for {:?}", helper_a_key));
+
+    let mut importer_files: Vec<PathBuf> = helper_a_importers
+      .iter()
+      .map(|(file, _local_name, _from_module, _is_dynamic)| file.clone())
+      .collect();
+    importer_files.sort();
+    assert_eq!(
+      importer_files,
+      vec![app_main.clone(), lib_b_index.clone()],
+      "helperA should be imported by both app/main.ts and lib-b/index.ts, got {:?}",
+      helper_a_importers
+    );
+
+    // helperB is imported only by app.
+    let helper_b_key = (lib_b_index.clone(), "helperB".to_string());
+    let helper_b_importers = analyzer
+      .import_index
+      .get(&helper_b_key)
+      .unwrap_or_else(|| panic!("Expected import index entry for {:?}", helper_b_key));
+    assert_eq!(helper_b_importers.len(), 1);
+    assert_eq!(helper_b_importers[0].0, app_main);
+    assert_eq!(helper_b_importers[0].1, "helperB");
+
+    // CONST_A is never imported anywhere, so it must not appear in the index.
+    let const_a_key = (lib_a_index, "CONST_A".to_string());
+    assert!(
+      !analyzer.import_index.contains_key(&const_a_key),
+      "CONST_A is never imported and must not appear in the import index"
+    );
   }
 }

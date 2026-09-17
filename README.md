@@ -11,7 +11,7 @@
 
 ## Overview
 
-domino is a drop-in replacement for the TypeScript version of [traf](https://github.com/@lemonade-hq/traf), providing the same semantic analysis capabilities with significantly better performance thanks to Rust and the Oxc parser.
+domino is a drop-in replacement for the TypeScript version of [traf](https://github.com/lemonade-hq/traf), providing the same semantic analysis capabilities with significantly better performance thanks to Rust and the Oxc parser.
 
 ## Features
 
@@ -20,6 +20,7 @@ domino is a drop-in replacement for the TypeScript version of [traf](https://git
 - **Lockfile Change Detection**: Detects dependency version changes in npm, yarn, pnpm, and bun lockfiles and traces affected projects
 - **Fast Oxc Parser**: 3-5x faster than TypeScript's compiler API
 - **Workspace Support**: Works with Nx, Turborepo, and generic npm/yarn/pnpm/bun workspaces
+- **Global Invalidation**: Honors Nx `namedInputs` workspace-root patterns (e.g. `sharedGlobals`) and Turborepo `globalDependencies` from `turbo.json` / `turbo.jsonc`, so a change to a shared root file marks every project affected
 - **Module Resolution**: Uses oxc_resolver (same as Rolldown and Nova) for accurate module resolution
 
 ## Quick Start
@@ -160,6 +161,7 @@ domino affected --lockfile-strategy full
 4. **Reference Finding**: Recursively finds all cross-file references to those symbols
 5. **Lockfile Analysis**: Detects dependency version changes and traces affected imports
 6. **Project Mapping**: Maps affected files to their owning projects
+7. **Implicit Dependencies**: Expands Nx `implicitDependencies` against known project **names**, including glob patterns (`app-*`, `integration-*-module`) and `!` exclusions — same idea as Nx/minimatch, not path globs
 
 ## Performance
 
@@ -230,11 +232,11 @@ RUST_LOG=domino=debug cargo run -- affected
 
 ## License
 
-Same as the original traf project.
+MIT - see [LICENSE](LICENSE).
 
 ## Credits
 
-This is a Rust port of the original [traf](https://github.com/@lemonade-hq/traf) TypeScript implementation.
+This is a Rust port of the original [traf](https://github.com/lemonade-hq/traf) TypeScript implementation.
 
 Built with:
 

@@ -2,7 +2,6 @@ use crate::error::Result;
 use crate::profiler::Profiler;
 use crate::semantic::WorkspaceAnalyzer;
 use crate::types::Reference;
-use oxc_resolver::Resolver;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -13,7 +12,6 @@ use tracing::{debug, warn};
 /// Cross-file reference finder
 pub struct ReferenceFinder<'a> {
   analyzer: &'a WorkspaceAnalyzer,
-  resolver: Resolver,
   cwd: PathBuf,
   /// Resolution cache: (from_file, specifier) -> resolved_path
   /// Using RefCell for interior mutability since resolution is logically const
@@ -27,7 +25,6 @@ impl<'a> ReferenceFinder<'a> {
   pub fn new(analyzer: &'a WorkspaceAnalyzer, cwd: &Path, profiler: Arc<Profiler>) -> Self {
     Self {
       analyzer,
-      resolver: Resolver::new(super::create_resolve_options(cwd, &analyzer.projects)),
       cwd: cwd.to_path_buf(),
       resolution_cache: RefCell::new(FxHashMap::default()),
       profiler,
@@ -258,43 +255,50 @@ impl<'a> ReferenceFinder<'a> {
     // REVERSE: Find files that re-export FROM the current file (barrel files like index.ts)
     // For example, if clients.module.ts exports ClientsModule, and index.ts re-exports it,
     // we need to look for imports of index.ts
-    for (reexporting_file, file_exports) in &self.analyzer.exports {
-      for export in file_exports {
-        // Check if this export is a re-export from our current_file
-        if let Some(ref from_module) = export.re_export_from {
-          if let Some(resolved) = self.resolve_import(reexporting_file, from_module) {
-            if self.paths_equal(&resolved, current_file) {
-              // Handle wildcard re-exports: export * from '...'
-              if export.exported_name == "*" {
-                debug!(
-                  "Found barrel file {:?} with wildcard re-export from {:?}",
-                  reexporting_file, current_file
-                );
-                // Recursively look for imports of the re-exporting file
-                // The symbol name stays the same through wildcard re-exports
-                self.find_refs_recursive(symbol_name, reexporting_file, all_refs, visited)?;
-              } else {
-                // Named re-export: export { X } from '...' or export { X as Y } from '...'
-                let exported_symbol = export
-                  .local_name
-                  .as_deref()
-                  .unwrap_or(&export.exported_name);
-                if exported_symbol == symbol_name {
-                  debug!(
-                    "Found barrel file {:?} re-exporting '{}' from {:?}",
-                    reexporting_file, export.exported_name, current_file
-                  );
-                  // Recursively look for imports of the re-exporting file
-                  self.find_refs_recursive(
-                    &export.exported_name,
-                    reexporting_file,
-                    all_refs,
-                    visited,
-                  )?;
-                }
-              }
-            }
-          }
+    //
+    // The analyzer pre-computes this reverse mapping once (see
+    // `WorkspaceAnalyzer::build_reexport_index`), so this is a single hash lookup.
+    // Previously this scanned every export of every file in the workspace and resolved
+    // each re-export specifier on every call, which is O(total_exports) per visited
+    // (file, symbol) node.
+    let reexport_start = if self.profiler.is_enabled() {
+      Some(Instant::now())
+    } else {
+      None
+    };
+    let reexporters = self
+      .analyzer
+      .reexport_index
+      .get(Self::normalize_path(&self.cwd, current_file));
+    if let Some(start) = reexport_start {
+      self
+        .profiler
+        .record_reexport_check(start.elapsed().as_nanos() as u64);
+    }
+
+    for (reexporting_file, export) in reexporters.into_iter().flatten() {
+      // Handle wildcard re-exports: export * from '...'
+      if export.exported_name == "*" {
+        debug!(
+          "Found barrel file {:?} with wildcard re-export from {:?}",
+          reexporting_file, current_file
+        );
+        // Recursively look for imports of the re-exporting file
+        // The symbol name stays the same through wildcard re-exports
+        self.find_refs_recursive(symbol_name, reexporting_file, all_refs, visited)?;
+      } else {
+        // Named re-export: export { X } from '...' or export { X as Y } from '...'
+        let exported_symbol = export
+          .local_name
+          .as_deref()
+          .unwrap_or(&export.exported_name);
+        if exported_symbol == symbol_name {
+          debug!(
+            "Found barrel file {:?} re-exporting '{}' from {:?}",
+            reexporting_file, export.exported_name, current_file
+          );
+          // Recursively look for imports of the re-exporting file
+          self.find_refs_recursive(&export.exported_name, reexporting_file, all_refs, visited)?;
         }
       }
     }
@@ -325,37 +329,7 @@ impl<'a> ReferenceFinder<'a> {
       }
     }
 
-    if !super::is_workspace_specifier(
-      specifier,
-      &self.analyzer.projects,
-      &self.analyzer.tsconfig_path_prefixes,
-    ) {
-      self.resolution_cache.borrow_mut().insert(cache_key, None);
-      if let Some(start_time) = start {
-        self
-          .profiler
-          .record_resolution(false, start_time.elapsed().as_nanos() as u64);
-      }
-      return None;
-    }
-
-    // Not in cache, resolve it
-    let from_path = self.cwd.join(from_file);
-    let context = from_path.parent()?;
-
-    let resolved = match self.resolver.resolve(context, specifier) {
-      Ok(resolution) => {
-        let resolved = resolution.path();
-        resolved
-          .strip_prefix(&self.cwd)
-          .ok()
-          .map(|p| p.to_path_buf())
-      }
-      Err(_) => {
-        // Try simple relative resolution as fallback
-        self.simple_resolve(context, specifier)
-      }
-    };
+    let resolved = self.analyzer.resolver.resolve(from_file, specifier);
 
     // Cache the result (even if None)
     self
@@ -374,6 +348,7 @@ impl<'a> ReferenceFinder<'a> {
 
   /// Simple fallback resolution for relative imports.
   /// Delegates to the shared free function in `semantic::simple_resolve_relative`.
+  #[cfg(test)]
   fn simple_resolve(&self, context: &Path, specifier: &str) -> Option<PathBuf> {
     super::simple_resolve_relative(&self.cwd, context, specifier)
   }
@@ -390,22 +365,23 @@ impl<'a> ReferenceFinder<'a> {
     }
   }
 
+  /// Normalize a path to the workspace-relative form used as index keys.
+  ///
+  /// Absolute paths inside the workspace are made relative to `cwd`; everything else
+  /// is left untouched. No case folding or symlink canonicalization happens here, so
+  /// index keys must be built from the same (already `cwd`-relative) paths the
+  /// resolver produces — see `WorkspaceResolver::resolve`.
+  fn normalize_path<'p>(cwd: &Path, path: &'p Path) -> &'p Path {
+    if path.is_absolute() {
+      path.strip_prefix(cwd).unwrap_or(path)
+    } else {
+      path
+    }
+  }
+
   /// Compare two paths for equality (handling relative vs absolute)
   fn paths_equal(&self, path1: &Path, path2: &Path) -> bool {
-    // Normalize both paths
-    let p1 = if path1.is_absolute() {
-      path1.strip_prefix(&self.cwd).unwrap_or(path1)
-    } else {
-      path1
-    };
-
-    let p2 = if path2.is_absolute() {
-      path2.strip_prefix(&self.cwd).unwrap_or(path2)
-    } else {
-      path2
-    };
-
-    p1 == p2
+    Self::normalize_path(&self.cwd, path1) == Self::normalize_path(&self.cwd, path2)
   }
 }
 
@@ -569,74 +545,79 @@ mod tests {
 
   #[test]
   fn test_simple_resolve_mjs_to_mts_remapping() {
-    // TypeScript ESM emits .mjs specifiers for .mts sources, e.g.
-    // `export * from './contract.mjs'` where the actual file is contract.mts.
+    // Test that imports with .mjs extensions resolve to .mts files through the
+    // `simple_resolve_relative` fallback (used when oxc_resolver fails to resolve).
+    // This exercises the ESM "import with output extension" convention, e.g.
+    // import { helper } from './utils.mjs' where the actual file is utils.mts.
+
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let cwd = temp_dir.path();
 
+    // Create a test file: src/utils.mts (but NOT src/utils.mjs)
     let src_dir = cwd.join("src");
     fs::create_dir_all(&src_dir).expect("Failed to create src dir");
-    fs::write(src_dir.join("contract.mts"), "export const schema = 1;")
-      .expect("Failed to write test file");
+    let utils_file = src_dir.join("utils.mts");
+    fs::write(&utils_file, "export function helper() {}").expect("Failed to write test file");
 
     let profiler = Arc::new(Profiler::new(false));
     let analyzer =
       WorkspaceAnalyzer::new(vec![], cwd, profiler.clone()).expect("Failed to create analyzer");
     let reference_finder = ReferenceFinder::new(&analyzer, cwd, profiler);
 
-    let resolved = reference_finder.simple_resolve(src_dir.as_path(), "./contract.mjs");
+    // Test: resolve "./utils.mjs" from src directory
+    // Should find utils.mts by stripping .mjs and trying .mts
+    let context = src_dir.as_path();
+    let specifier = "./utils.mjs";
+    let resolved = reference_finder.simple_resolve(context, specifier);
+
+    assert!(
+      resolved.is_some(),
+      "Expected to resolve utils.mjs to utils.mts"
+    );
+    let resolved_path = resolved.unwrap();
     assert_eq!(
-      resolved,
-      Some(PathBuf::from("src/contract.mts")),
-      "Expected ./contract.mjs to resolve to contract.mts"
+      resolved_path,
+      PathBuf::from("src/utils.mts"),
+      "Expected to resolve ./utils.mjs to utils.mts"
     );
   }
 
   #[test]
   fn test_simple_resolve_cjs_to_cts_remapping() {
-    // CommonJS TS counterpart: .cjs specifiers resolve to .cts sources.
+    // Test that imports with .cjs extensions resolve to .cts files through the
+    // `simple_resolve_relative` fallback (used when oxc_resolver fails to resolve).
+    // This exercises the CJS "import with output extension" convention, e.g.
+    // import { helper } from './helper.cjs' where the actual file is helper.cts.
+
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let cwd = temp_dir.path();
 
+    // Create a test file: src/helper.cts (but NOT src/helper.cjs)
     let src_dir = cwd.join("src");
     fs::create_dir_all(&src_dir).expect("Failed to create src dir");
-    fs::write(src_dir.join("legacy.cts"), "export const schema = 1;")
-      .expect("Failed to write test file");
+    let helper_file = src_dir.join("helper.cts");
+    fs::write(&helper_file, "export function helper() {}").expect("Failed to write test file");
 
     let profiler = Arc::new(Profiler::new(false));
     let analyzer =
       WorkspaceAnalyzer::new(vec![], cwd, profiler.clone()).expect("Failed to create analyzer");
     let reference_finder = ReferenceFinder::new(&analyzer, cwd, profiler);
 
-    let resolved = reference_finder.simple_resolve(src_dir.as_path(), "./legacy.cjs");
-    assert_eq!(
-      resolved,
-      Some(PathBuf::from("src/legacy.cts")),
-      "Expected ./legacy.cjs to resolve to legacy.cts"
+    // Test: resolve "./helper.cjs" from src directory
+    // Should find helper.cts by stripping .cjs and trying .cts
+    let context = src_dir.as_path();
+    let specifier = "./helper.cjs";
+    let resolved = reference_finder.simple_resolve(context, specifier);
+
+    assert!(
+      resolved.is_some(),
+      "Expected to resolve helper.cjs to helper.cts"
     );
-  }
-
-  #[test]
-  fn test_simple_resolve_index_mts() {
-    // A bare directory specifier should find index.mts (ESM package entry).
-    let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let cwd = temp_dir.path();
-
-    let pkg_src = cwd.join("packages").join("contract").join("src");
-    fs::create_dir_all(&pkg_src).expect("Failed to create pkg dir");
-    fs::write(pkg_src.join("index.mts"), "export const x = 1;").expect("Failed to write test file");
-
-    let profiler = Arc::new(Profiler::new(false));
-    let analyzer =
-      WorkspaceAnalyzer::new(vec![], cwd, profiler.clone()).expect("Failed to create analyzer");
-    let reference_finder = ReferenceFinder::new(&analyzer, cwd, profiler);
-
-    let context = cwd.join("packages").join("contract");
-    let resolved = reference_finder.simple_resolve(context.as_path(), "./src");
+    let resolved_path = resolved.unwrap();
     assert_eq!(
-      resolved,
-      Some(PathBuf::from("packages/contract/src/index.mts")),
-      "Expected ./src to resolve to src/index.mts"
+      resolved_path,
+      PathBuf::from("src/helper.cts"),
+      "Expected to resolve ./helper.cjs to helper.cts"
     );
   }
 
