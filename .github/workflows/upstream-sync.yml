@@ -1,0 +1,158 @@
+name: Upstream Sync
+
+'on':
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag to rebase onto (default: latest)'
+        required: false
+
+env:
+  UPSTREAM_URL: https://github.com/frontops-dev/domino
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  rebase:
+    name: Rebase fork patches onto upstream
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      # Conflict resolutions recorded by rerere are the expensive part of a sync.
+      # Caching them lets a resolution made once — locally or in an earlier run —
+      # replay on every later rebase instead of being re-derived by hand.
+      - name: Restore recorded conflict resolutions
+        uses: actions/cache@v4
+        with:
+          path: .git/rr-cache
+          key: rerere-${{ github.run_id }}
+          restore-keys: rerere-
+
+      - name: Select upstream tag
+        id: upstream
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config rerere.enabled true
+          git config rerere.autoupdate true
+
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch -q upstream --tags
+
+          tag="${{ inputs.tag }}"
+          if [ -z "$tag" ]; then
+            tag=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1)
+          fi
+          if [ -z "$tag" ]; then
+            echo "::error::No upstream release tag found"
+            exit 1
+          fi
+
+          echo "Latest upstream release: $tag"
+          if git merge-base --is-ancestor "$tag" HEAD; then
+            echo "Already rebased onto $tag — nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Rebase fork patches
+        if: steps.upstream.outputs.skip == 'false'
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git checkout -B "sync/$TAG"
+
+          status=0
+          git rebase "$TAG" || status=$?
+
+          # rerere stages what it recognises but never advances the rebase itself,
+          # so drive it forward: bail on anything still conflicted, skip commits
+          # upstream has since made redundant, continue otherwise. Bounded so a
+          # misread state can never spin.
+          for _ in $(seq 1 20); do
+            [ "$status" -eq 0 ] && break
+            unresolved=$(git diff --name-only --diff-filter=U)
+            if [ -n "$unresolved" ]; then
+              echo "::error::Conflict rerere could not resolve while rebasing onto $TAG"
+              echo "$unresolved"
+              exit 1
+            fi
+            status=0
+            if git diff --cached --quiet; then
+              GIT_EDITOR=true git rebase --skip || status=$?
+            else
+              GIT_EDITOR=true git rebase --continue || status=$?
+            fi
+          done
+
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Rebase onto $TAG did not converge"
+            exit 1
+          fi
+
+      # A clean rebase does not mean the stack survived: a patch upstream has
+      # reimplemented is dropped silently by patch-id, and a patch that conflicts
+      # into emptiness is skipped above. Both are legitimate outcomes, but both
+      # must be an explicit edit to the manifest rather than a silent loss.
+      - name: Verify the patch stack
+        if: steps.upstream.outputs.skip == 'false'
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git log --format=%s --no-merges "$TAG"..HEAD > /tmp/actual-patches.txt
+          # patches.txt carries a trailing "| <upstream PR>" column; the subject
+          # before it is the part git can be compared against.
+          sed 's/[[:space:]]*|.*$//' .fork/patches.txt > /tmp/expected-patches.txt
+          if ! diff -u /tmp/expected-patches.txt /tmp/actual-patches.txt; then
+            echo "::error::Patch stack no longer matches .fork/patches.txt (see diff above)"
+            echo "If upstream has absorbed a patch, drop its line from .fork/patches.txt."
+            exit 1
+          fi
+          echo "All $(wc -l < .fork/patches.txt) fork patches replayed."
+
+      - name: Push and open PR
+        if: steps.upstream.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git push -u origin "sync/$TAG" --force-with-lease
+
+          if gh pr view "sync/$TAG" >/dev/null 2>&1; then
+            echo "PR already open for sync/$TAG — updated in place."
+            exit 0
+          fi
+
+          {
+            echo "Fork patches replayed onto upstream \`$TAG\`. The diff against \`main\` is upstream's changes — the fork patches are identical on both sides."
+            echo
+            echo "**Land this by force-pushing, not by merging.** A merge would put a merge commit between \`main\` and upstream and reintroduce the duplicated history this setup exists to avoid:"
+            echo
+            echo '```'
+            echo "git fetch origin"
+            echo "git push --force-with-lease origin origin/sync/$TAG:main"
+            echo '```'
+            echo
+            echo "Patches verified against \`.fork/patches.txt\`: all replayed."
+          } > /tmp/pr-body.md
+
+          gh pr create \
+            --base main \
+            --head "sync/$TAG" \
+            --title "chore(fork): rebase onto upstream $TAG" \
+            --body-file /tmp/pr-body.md

@@ -1,0 +1,93 @@
+name: Fork Release
+
+# CI already builds every target on a push to main; this picks up those artifacts
+# and publishes them as a GitHub release. Same shape as preview-release.yml, which
+# does the equivalent for pull requests. Upstream's npm publish job in CI.yml is
+# disabled — see the comment there.
+'on':
+  workflow_run:
+    workflows: ['CI']
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Publish GitHub release
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: bindings-*
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Collect release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find artifacts -type f \( -name 'domino-*' -o -name 'domino.*.node' -o -name 'domino.*.wasm' \) -exec cp -t release/ {} +
+          if [ -z "$(ls -A release)" ]; then
+            echo "::error::No build artifacts found to release"
+            exit 1
+          fi
+          (cd release && sha256sum -- * > SHA256SUMS)
+          ls -l release
+
+      - name: Determine release tag
+        id: release
+        run: |
+          set -euo pipefail
+          # The fork deliberately never bumps package.json: the version field is
+          # upstream's and rewriting it conflicts on every upstream release. Tag as
+          # the upstream base version plus a fork counter, so releases stay monotonic
+          # without any tracked file diverging. Counting up to the first free slot
+          # rather than counting tags keeps this correct across deleted releases.
+          base=$(jq -r .version package.json)
+          n=1
+          while git rev-parse -q --verify "refs/tags/fork-v${base}-${n}" >/dev/null; do
+            n=$((n + 1))
+          done
+          echo "tag=fork-v${base}-${n}" >> "$GITHUB_OUTPUT"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.release.outputs.tag }}
+          BASE: ${{ steps.release.outputs.base }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Fork build of upstream \`${BASE}\` at \`${HEAD_SHA}\`."
+            echo
+            echo "This fork is not published to npm — download the binary for your platform below."
+            echo "Verify with \`sha256sum -c SHA256SUMS\`."
+            echo
+            echo "### Fork patches on top of upstream"
+            echo
+            sed 's/[[:space:]]*|.*$//; s/^/- /' .fork/patches.txt
+          } > notes.md
+          gh release create "$TAG" release/* \
+            --target "$HEAD_SHA" \
+            --title "$TAG" \
+            --notes-file notes.md
