@@ -5,6 +5,7 @@ env:
   MACOSX_DEPLOYMENT_TARGET: '10.13'
   CARGO_INCREMENTAL: '1'
 'on':
+  workflow_dispatch: {}
   push:
     branches:
       - main
@@ -380,10 +381,10 @@ jobs:
           path: pr-metadata.json
   publish:
     name: Publish
-    # `[skip release]` anywhere in the pushed commit's message skips publishing but
-    # still runs the full build and test matrix. The next unmarked push releases the
-    # skipped commits too: the bump reads every commit subject since the last tag.
-    if: github.event_name == 'push' && !contains(github.event.head_commit.message, '[skip release]')
+    # This fork ships GitHub release binaries, not npm packages: see
+    # .github/workflows/fork-release.yml. Upstream's job is left intact rather
+    # than deleted so upstream edits to it keep applying cleanly on rebase.
+    if: false
     runs-on: ubuntu-latest
     # Main-branch runs are no longer cancelled, so several can be in flight at once.
     # Releases must still happen one at a time: queue publishes instead of overlapping
