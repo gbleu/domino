@@ -5,6 +5,7 @@ env:
   MACOSX_DEPLOYMENT_TARGET: '10.13'
   CARGO_INCREMENTAL: '1'
 'on':
+  workflow_dispatch: {}
   push:
     branches:
       - main
@@ -142,6 +143,9 @@ jobs:
           node-version: 24
       - name: Determine version bump
         id: version
+        # The fork never bumps (.fork/README.md rule 3). Skipped, this leaves release empty,
+        # so build compiles package.json's version, not one derived from the fork's stale v* tags.
+        if: false
         env:
           EVENT_NAME: ${{ github.event_name }}
           HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
@@ -545,8 +549,10 @@ jobs:
           path: pr-metadata.json
   publish:
     name: Publish
-    # The release-version job decides whether and what to release; see there.
-    if: github.event_name == 'push' && needs.release-version.outputs.release == 'true'
+    # This fork ships GitHub release binaries, not npm packages: see
+    # .github/workflows/fork-release.yml. Upstream's job is left intact rather
+    # than deleted so upstream edits to it keep applying cleanly on rebase.
+    if: false
     runs-on: ubuntu-latest
     # Main-branch runs are no longer cancelled, so several can be in flight at once.
     # Releases must still happen one at a time, so publishes never overlap. The group
