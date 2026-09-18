@@ -1,0 +1,214 @@
+name: Upstream Sync
+
+'on':
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag to rebase onto (default: latest)'
+        required: false
+
+env:
+  UPSTREAM_URL: https://github.com/frontops-dev/domino
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  rebase:
+    name: Rebase fork patches onto upstream
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+
+      - name: Select upstream tag
+        id: upstream
+        env:
+          # Never interpolate an input into the script: GitHub substitutes it before bash
+          # parses the line, so shell syntax in a dispatch input would run with this job's
+          # write permissions and the persisted checkout credential.
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "$UPSTREAM_URL"
+          # Into a private namespace, not refs/tags: this fork's old publish job created
+          # its own v<version> tags, and upstream reuses those names for different commits,
+          # so a plain --tags fetch aborts with "would clobber existing tag" and takes every
+          # scheduled sync down with it.
+          git fetch -q upstream '+refs/tags/*:refs/upstream-tags/*'
+
+          tag="$REQUESTED_TAG"
+          if [ -z "$tag" ]; then
+            tag=$(git for-each-ref --format='%(refname:lstrip=2)' --sort=-v:refname \
+              'refs/upstream-tags/v[0-9]*' | head -1)
+          fi
+          if [ -z "$tag" ]; then
+            echo "::error::No upstream release tag found"
+            exit 1
+          fi
+
+          ref="refs/upstream-tags/$tag"
+          if ! git rev-parse -q --verify "$ref" >/dev/null; then
+            echo "::error::Upstream has no tag $tag"
+            exit 1
+          fi
+
+          echo "Latest upstream release: $tag"
+          if git merge-base --is-ancestor "$ref" HEAD; then
+            echo "Already rebased onto $tag — nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      # The stack only survives if a sync lands by force-push. Merging or squashing a
+      # sync PR collapses the patches into one commit, after which every later run would
+      # fail the post-rebase check with a confusing subject diff. Fail here instead, on
+      # the pre-rebase history, naming the cause.
+      - name: Verify the patch stack before rebasing
+        if: steps.upstream.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          count=$(wc -l < .fork/patches.txt)
+          sed 's/[[:space:]]*|.*$//' .fork/patches.txt > /tmp/expected-patches.txt
+          git log --format=%s -n "$count" HEAD > /tmp/head-patches.txt
+          if ! diff -u /tmp/expected-patches.txt /tmp/head-patches.txt; then
+            echo "::error::main's top $count commits are not the stack in .fork/patches.txt"
+            echo "A sync PR merged or squashed instead of force-pushed collapses the stack."
+            echo "Rebuild main as upstream + the manifest patches, then re-run."
+            exit 1
+          fi
+          if [ -n "$(git rev-list --merges -n 1 "HEAD~${count}..HEAD")" ]; then
+            echo "::error::Merge commit inside the patch stack; main must stay linear."
+            exit 1
+          fi
+
+      - name: Rebase fork patches
+        if: steps.upstream.outputs.skip == 'false'
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+          REF: ${{ steps.upstream.outputs.ref }}
+        run: |
+          set -euo pipefail
+          git checkout -B "sync/$TAG"
+
+          status=0
+          git rebase "$REF" || status=$?
+
+          # This runner resolves nothing: rerere replays only resolutions recorded in
+          # the same .git, and a resolution made on a maintainer's machine never
+          # reaches here. So a conflict is always a stop — the loop exists for the
+          # other case, a patch upstream has made redundant, which rebase reports as
+          # an empty commit rather than a conflict. Bounded so a misread state cannot
+          # spin.
+          for _ in $(seq 1 20); do
+            [ "$status" -eq 0 ] && break
+            unresolved=$(git diff --name-only --diff-filter=U)
+            if [ -n "$unresolved" ]; then
+              echo "::error::Conflict while rebasing onto $TAG — resolve it locally and push"
+              echo "git fetch upstream --tags && git rebase $TAG   # then force-push to main"
+              echo "$unresolved"
+              exit 1
+            fi
+            status=0
+            if git diff --cached --quiet; then
+              GIT_EDITOR=true git rebase --skip || status=$?
+            else
+              GIT_EDITOR=true git rebase --continue || status=$?
+            fi
+          done
+
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Rebase onto $TAG did not converge"
+            exit 1
+          fi
+
+      # A clean rebase does not mean the stack survived: a patch upstream has
+      # reimplemented is dropped silently by patch-id, and a patch that conflicts
+      # into emptiness is skipped above. Both are legitimate outcomes, but both
+      # must be an explicit edit to the manifest rather than a silent loss.
+      - name: Verify the patch stack
+        if: steps.upstream.outputs.skip == 'false'
+        env:
+          REF: ${{ steps.upstream.outputs.ref }}
+        run: |
+          set -euo pipefail
+          git log --format=%s --no-merges "$REF"..HEAD > /tmp/actual-patches.txt
+          # patches.txt carries a trailing "| <upstream PR>" column; the subject
+          # before it is the part git can be compared against.
+          sed 's/[[:space:]]*|.*$//' .fork/patches.txt > /tmp/expected-patches.txt
+          if ! diff -u /tmp/expected-patches.txt /tmp/actual-patches.txt; then
+            echo "::error::Patch stack no longer matches .fork/patches.txt (see diff above)"
+            echo "If upstream has absorbed a patch, drop its line from .fork/patches.txt."
+            exit 1
+          fi
+          echo "All $(wc -l < .fork/patches.txt) fork patches replayed."
+
+      # A push or PR authored with GITHUB_TOKEN does not start a workflow run, so without
+      # a PAT the sync PR would carry no signal at all — precisely when upstream may have
+      # refactored beneath every replayed patch. Run the checks a contributor runs locally,
+      # here, so the PR always says something even when CI stays silent.
+      - name: Run fast checks on the rebased stack
+        if: steps.upstream.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          rustup show
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --no-default-features -- -D warnings
+          cargo test --lib --no-default-features
+          cargo test --no-default-features --test integration_test -- --test-threads=1
+
+      - name: Push and open PR
+        if: steps.upstream.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+          HAS_PAT: ${{ secrets.GH_PAT != '' }}
+        run: |
+          set -euo pipefail
+          git push -u origin "sync/$TAG" --force-with-lease
+
+          # `gh pr view <branch>` also finds a closed PR, which would leave a rerun
+          # silently without one; list open PRs by head instead.
+          if [ -n "$(gh pr list --head "sync/$TAG" --state open --json number --jq '.[].number')" ]; then
+            echo "PR already open for sync/$TAG — updated in place."
+            exit 0
+          fi
+
+          {
+            echo "Fork patches replayed onto upstream \`$TAG\`. The diff against \`main\` is upstream's changes — the fork patches are identical on both sides."
+            echo
+            echo "**Land this by force-pushing, not by merging.** A merge would put a merge commit between \`main\` and upstream and reintroduce the duplicated history this setup exists to avoid:"
+            echo
+            echo '```'
+            echo "git fetch origin"
+            echo "git push --force-with-lease origin origin/sync/$TAG:main"
+            echo '```'
+            echo
+            echo "Patches verified against \`.fork/patches.txt\`: all replayed, and the fast"
+            echo "checks (fmt, clippy, unit + integration tests) passed in the sync job."
+            if [ "$HAS_PAT" != "true" ]; then
+              echo
+              echo "> No \`GH_PAT\` is configured, so this branch was pushed with \`GITHUB_TOKEN\`"
+              echo "> and GitHub will not start CI for it. Dispatch \`CI.yml\` against"
+              echo "> \`sync/$TAG\` to get the full build matrix."
+            fi
+          } > /tmp/pr-body.md
+
+          gh pr create \
+            --base main \
+            --head "sync/$TAG" \
+            --title "chore(fork): rebase onto upstream $TAG" \
+            --body-file /tmp/pr-body.md
