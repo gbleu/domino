@@ -1,0 +1,5 @@
+chore(fork): automate releases and the upstream rebase | fork-only
+fix(semantic): resolve project tsconfig paths aliases | upstream#95
+fix(semantic): cascade the default export through dynamic imports | not submitted
+feat(workspace): merge package-manager workspace members into Nx discovery | upstream#78
+ci(fork): allow manual dispatch and disable the npm publish job | fork-only

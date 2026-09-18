@@ -372,7 +372,10 @@ jobs:
           path: pr-metadata.json
   publish:
     name: Publish
-    if: github.event_name == 'push'
+    # This fork ships GitHub release binaries, not npm packages: see
+    # .github/workflows/fork-release.yml. Upstream's job is left intact rather
+    # than deleted so upstream edits to it keep applying cleanly on rebase.
+    if: false
     runs-on: ubuntu-latest
     permissions:
       contents: write
