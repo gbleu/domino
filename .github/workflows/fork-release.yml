@@ -1,0 +1,147 @@
+name: Fork Release
+
+# CI already builds every target on a push to main; this picks up those artifacts
+# and publishes them as a GitHub release. Same shape as preview-release.yml, which
+# does the equivalent for pull requests. Upstream's npm publish job in CI.yml is
+# disabled — see the comment there.
+'on':
+  workflow_run:
+    workflows: ['CI']
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Publish GitHub release
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: bindings-*
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Collect release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find artifacts -type f \( -name 'domino-*' -o -name 'domino.*.node' -o -name 'domino.*.wasm' \) -exec cp -t release/ {} +
+          if [ -z "$(ls -A release)" ]; then
+            echo "::error::No build artifacts found to release"
+            exit 1
+          fi
+          (cd release && sha256sum -- * > SHA256SUMS)
+          ls -l release
+
+      - name: Determine release tag
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          # The fork deliberately never bumps package.json: the version field is
+          # upstream's and rewriting it conflicts on every upstream release. Tag as
+          # the upstream base version plus a fork counter, so releases stay monotonic
+          # without any tracked file diverging. Counting up to the first free slot
+          # rather than counting tags keeps this correct across deleted releases.
+          base=$(jq -r .version package.json)
+
+          # Re-running a successful CI run refires workflow_run with the same head_sha, and
+          # the counter below would happily mint a second tag for a commit already released.
+          # A release creates its tag at that commit, so one pointing here means it is done.
+          # The tag alone is not proof: deleting a release without --cleanup-tag leaves the
+          # tag behind, and skipping on that would strand this commit with no downloadable
+          # release forever. Only a published release counts; an orphaned tag just means the
+          # counter below moves past it.
+          # Every fork tag on the commit, not just the first: the orphan recovery below
+          # publishes the retry under the next counter, so a commit can legitimately carry
+          # an orphaned tag *and* the published one, and checking only the older of the two
+          # would publish a third.
+          for tag in $(git tag --points-at HEAD | grep '^fork-v' || true); do
+            if [ "$(gh release view "$tag" --json isDraft --jq '.isDraft' 2>/dev/null)" = "false" ]; then
+              echo "$HEAD_SHA is already released as $tag — nothing to do."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "$tag has no published release — it does not count as released"
+          done
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+          n=1
+          while git rev-parse -q --verify "refs/tags/fork-v${base}-${n}" >/dev/null; do
+            n=$((n + 1))
+          done
+          echo "tag=fork-v${base}-${n}" >> "$GITHUB_OUTPUT"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        if: steps.release.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.release.outputs.tag }}
+          BASE: ${{ steps.release.outputs.base }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Fork build of upstream \`${BASE}\` at \`${HEAD_SHA}\`."
+            echo
+            echo "This fork is not published to npm — download the binary for your platform below."
+            echo
+            echo "Release assets carry no file mode, so set the execute bit on download."
+            echo "\`SHA256SUMS\` lists every asset, so verify the one file you fetched rather"
+            echo "than running \`sha256sum -c SHA256SUMS\`, which reports all the others missing:"
+            echo
+            echo '```dockerfile'
+            echo "RUN curl -fsSL --retry 3 \\"
+            echo "      \"https://github.com/${GH_REPO}/releases/download/${TAG}/domino-x86_64-unknown-linux-musl\" \\"
+            echo "      -o /tmp/domino && \\"
+            echo "  echo \"\${DOMINO_SHA256}  /tmp/domino\" | sha256sum -c - && \\"
+            echo "  install -m 0755 /tmp/domino /usr/local/bin/domino && \\"
+            echo "  rm /tmp/domino"
+            echo '```'
+            echo
+            echo "Interactively, \`sha256sum --ignore-missing -c SHA256SUMS\` checks just what you have."
+            echo
+            echo "### Fork patches on top of upstream"
+            echo
+            sed 's/[[:space:]]*|.*$//; s/^/- /' .fork/patches.txt
+          } > notes.md
+          # `gh release create` with assets creates a draft, uploads, then publishes, so a
+          # failure part-way can strand a draft under this tag. A draft is by definition
+          # incomplete and its tag is not created until publish, so clearing it lets the
+          # retry proceed; a published release is never touched.
+          state=$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null || true)
+          if [ "$state" = "true" ]; then
+            echo "Removing stranded draft release $TAG from an earlier failed run"
+            gh release delete "$TAG" --yes
+          elif [ -n "$state" ]; then
+            echo "::error::$TAG is already published — refusing to overwrite it"
+            exit 1
+          fi
+
+          gh release create "$TAG" release/* \
+            --target "$HEAD_SHA" \
+            --title "$TAG" \
+            --notes-file notes.md
