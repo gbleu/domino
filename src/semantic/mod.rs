@@ -1,5 +1,6 @@
 pub mod analyzer;
 pub mod assets;
+pub mod package_exports;
 pub mod reference_finder;
 mod resolve_options;
 mod tsconfig_paths;
@@ -9,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 pub use analyzer::WorkspaceAnalyzer;
 pub use assets::AssetReferenceFinder;
+pub use package_exports::PackageIndex;
 pub use reference_finder::ReferenceFinder;
 pub(crate) use resolve_options::parse_tsconfig_path_prefixes;
 pub(crate) use workspace_resolver::WorkspaceResolver;

@@ -6006,3 +6006,96 @@ fn test_project_tsconfig_path_alias_lazy_import() {
     affected
   );
 }
+
+/// Scaffolds `packages/ui` (with the given `package.json`) holding
+/// `src/styles/x.css`, and `apps/app/src/index.tsx` pulling the stylesheet in
+/// via a side-effect import of `import_specifier`, then changes only `x.css`.
+fn affected_after_package_css_change(ui_manifest: &str, import_specifier: &str) -> Vec<String> {
+  let tmp = TempDir::new().unwrap();
+  let root = tmp.path().canonicalize().unwrap();
+  fs::create_dir_all(root.join("packages/ui/src/styles")).unwrap();
+  fs::create_dir_all(root.join("apps/app/src")).unwrap();
+  fs::write(root.join("packages/ui/package.json"), ui_manifest).unwrap();
+  fs::write(
+    root.join("packages/ui/src/styles/x.css"),
+    ".x { color: red; }\n",
+  )
+  .unwrap();
+  fs::write(
+    root.join("apps/app/src/index.tsx"),
+    format!("import \"{import_specifier}\";\n\nexport const App = () => null;\n"),
+  )
+  .unwrap();
+
+  git_in(&root, &["init"]);
+  git_in(&root, &["config", "user.email", "test@test.com"]);
+  git_in(&root, &["config", "user.name", "Test"]);
+  git_in(&root, &["branch", "-M", "main"]);
+  git_in(&root, &["add", "."]);
+  git_in(&root, &["commit", "-m", "initial"]);
+  git_in(&root, &["checkout", "-b", "feature"]);
+  fs::write(
+    root.join("packages/ui/src/styles/x.css"),
+    ".x { color: blue; }\n",
+  )
+  .unwrap();
+  git_in(&root, &["add", "."]);
+  git_in(&root, &["commit", "-m", "restyle"]);
+
+  let project = |name: &str, root: &str| Project {
+    name: name.to_string(),
+    root: PathBuf::from(root),
+    source_root: PathBuf::from(root).join("src"),
+    ts_config: None,
+    implicit_dependencies: vec![],
+    targets: vec![],
+  };
+  let config = TrueAffectedConfig {
+    cwd: root.clone(),
+    base: "main".to_string(),
+    head: None,
+    projects: vec![project("ui", "packages/ui"), project("app", "apps/app")],
+    lockfile_strategy: LockfileStrategy::None,
+  };
+  find_affected(config, Arc::new(Profiler::new(false)))
+    .expect("find_affected failed")
+    .affected_projects
+}
+
+#[test]
+fn test_css_imported_by_package_specifier_via_exports_affects_consumer() {
+  let affected = affected_after_package_css_change(
+    r#"{ "name": "@scope/ui", "exports": { "./styles/x.css": "./src/styles/x.css" } }"#,
+    "@scope/ui/styles/x.css",
+  );
+  assert!(affected.contains(&"ui".to_string()), "Got: {:?}", affected);
+  assert!(
+    affected.contains(&"app".to_string()),
+    "app imports the changed stylesheet via its package export. Got: {:?}",
+    affected
+  );
+}
+
+#[test]
+fn test_css_imported_by_package_specifier_via_wildcard_exports_affects_consumer() {
+  let affected = affected_after_package_css_change(
+    r#"{ "name": "@scope/ui", "exports": { ".": "./src/index.ts", "./styles/*": { "style": "./src/styles/*" } } }"#,
+    "@scope/ui/styles/x.css",
+  );
+  assert!(
+    affected.contains(&"app".to_string()),
+    "app imports the changed stylesheet via a wildcard export. Got: {:?}",
+    affected
+  );
+}
+
+#[test]
+fn test_css_imported_by_package_specifier_without_exports_affects_consumer() {
+  let affected =
+    affected_after_package_css_change(r#"{ "name": "@scope/ui" }"#, "@scope/ui/src/styles/x.css");
+  assert!(
+    affected.contains(&"app".to_string()),
+    "app imports the changed stylesheet via the package root. Got: {:?}",
+    affected
+  );
+}

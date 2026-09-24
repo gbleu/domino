@@ -235,6 +235,11 @@ reflect the order features were added, not execution order (`Step 6` appears twi
   prevent the two from drifting. Also home of `is_workspace_specifier` (see pitfall below)
 - **`src/semantic/assets.rs`**: Finds source-file references to non-source assets, so a changed
   template or stylesheet can be traced to the code that uses it
+- **`src/semantic/package_exports.rs`**: `PackageIndex` maps bare specifiers (`@scope/ui/styles/x.css`) to
+  workspace files from each project root's `package.json` — longest `name` prefix, then `exports` (exact,
+  conditional, `*` patterns; every conditional target is returned since consumer conditions are unknown), or
+  `<root>/<subpath>` when there is no `exports`. Used by the asset finder so a package-name side-effect
+  import (`import "@scope/ui/styles/x.css"`) marks its importer affected
 - **`src/lockfile.rs`**: Lockfile diffing for npm/yarn/pnpm/bun - detects changed direct
   dependencies, builds a reverse dependency graph for transitive impact, then maps results to the
   source files importing them. Refuses lockfiles over 256 MB to avoid OOM on constrained CI runners
