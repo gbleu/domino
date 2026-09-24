@@ -10,6 +10,7 @@
 //! 4. Return source file references for further analysis
 
 use crate::error::Result;
+use crate::semantic::package_exports::{normalize, PackageIndex};
 use crate::types::AssetReference;
 use crate::utils::is_source_file;
 use ignore::WalkBuilder;
@@ -25,6 +26,7 @@ pub struct AssetReferenceFinder {
   cwd: PathBuf,
   /// Cache for compiled regex patterns: filename -> regex
   regex_cache: RefCell<rustc_hash::FxHashMap<String, Regex>>,
+  packages: PackageIndex,
 }
 
 impl AssetReferenceFinder {
@@ -33,7 +35,13 @@ impl AssetReferenceFinder {
     Self {
       cwd: cwd.to_path_buf(),
       regex_cache: RefCell::new(rustc_hash::FxHashMap::default()),
+      packages: PackageIndex::default(),
     }
+  }
+
+  pub fn with_packages(mut self, packages: PackageIndex) -> Self {
+    self.packages = packages;
+    self
   }
 
   /// Find all source files that reference any of the given asset files.
@@ -189,13 +197,16 @@ impl AssetReferenceFinder {
     // Get the directory containing the source file
     let source_dir = source_file.parent().unwrap_or(Path::new("."));
 
-    // Resolve the relative path from the source file's directory
-    let resolved = if rel_path.starts_with("./") || rel_path.starts_with("../") {
-      self.cwd.join(source_dir).join(rel_path)
-    } else {
-      // Absolute or bare path - just join with source dir
-      self.cwd.join(source_dir).join(rel_path)
-    };
+    let is_bare = !rel_path.starts_with('.') && !rel_path.starts_with('/');
+    if is_bare {
+      let asset_rel = normalize(asset_path.strip_prefix(&self.cwd).unwrap_or(asset_path));
+      if self.packages.resolve(rel_path).contains(&asset_rel) {
+        return true;
+      }
+    }
+
+    // Relative, or bare-but-file-relative (e.g. Angular `templateUrl: 'x.html'`)
+    let resolved = self.cwd.join(source_dir).join(rel_path);
 
     // Normalize both paths for comparison
     let resolved_normalized = self.normalize_path(&resolved);

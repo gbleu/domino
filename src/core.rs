@@ -5,7 +5,7 @@ use crate::named_inputs;
 use crate::path_aliases;
 use crate::profiler::Profiler;
 use crate::semantic::analyzer::FileSemanticData;
-use crate::semantic::{AssetReferenceFinder, ReferenceFinder, WorkspaceAnalyzer};
+use crate::semantic::{AssetReferenceFinder, PackageIndex, ReferenceFinder, WorkspaceAnalyzer};
 use crate::types::{
   AffectCause, AffectedProjectInfo, AffectedReport, AffectedResult, ChangedFile, GlobalTrigger,
   LockfileStrategy, Project, ReportTotals, RootTsconfigStrategy, TrueAffectedConfig,
@@ -424,7 +424,8 @@ fn find_affected_internal(
   // Step 6b: Process non-source asset files
   if !asset_files.is_empty() {
     debug!("Processing {} asset files", asset_files.len());
-    let asset_finder = AssetReferenceFinder::new(&config.cwd);
+    let asset_finder = AssetReferenceFinder::new(&config.cwd)
+      .with_packages(PackageIndex::from_projects(&config.cwd, &config.projects));
 
     // Scan the workspace exactly once for the whole batch of changed assets,
     // instead of once per asset (a full directory walk + re-reading every
