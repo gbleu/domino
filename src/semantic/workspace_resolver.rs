@@ -508,4 +508,152 @@ mod tests {
       "the innermost project's tsconfig wins over the workspace-root one"
     );
   }
+
+  /// A package declaring Node subpath imports (`package.json` "imports"), a nested
+  /// package declaring the same key for its own files, and a package declaring none.
+  fn package_imports_workspace() -> (TempDir, PathBuf) {
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path().canonicalize().unwrap();
+    for dir in [
+      "apps/my-app/config",
+      "apps/my-app/src/lib/internal",
+      "apps/my-app/src/internal",
+      "apps/my-app/src/runtime",
+      "apps/my-app/nested/lib",
+      "apps/web/src/lib",
+    ] {
+      fs::create_dir_all(cwd.join(dir)).unwrap();
+    }
+    fs::write(
+      cwd.join("apps/my-app/package.json"),
+      r##"{
+  "name": "my-app",
+  "type": "module",
+  "imports": {
+    "#config": "./config/index.ts",
+    "#lib/*": "./src/lib/*",
+    "#lib/internal/*": "./src/internal/*",
+    "#runtime": { "node": "./src/runtime/node.ts", "import": "./src/runtime/esm.ts", "default": "./src/runtime/fallback.ts" },
+    "#runtime-fallback": { "browser": "./src/runtime/browser.ts", "default": "./src/runtime/fallback.ts" },
+    "#array": ["../outside.ts", "./src/runtime/esm.ts"],
+    "#external": "some-external-package"
+  }
+}"##,
+    )
+    .unwrap();
+    fs::write(
+      cwd.join("apps/my-app/nested/package.json"),
+      r##"{ "name": "my-app-nested", "imports": { "#lib/*": "./lib/*" } }"##,
+    )
+    .unwrap();
+    fs::write(cwd.join("apps/web/package.json"), r#"{ "name": "web" }"#).unwrap();
+    for file in [
+      "apps/my-app/config/index.ts",
+      "apps/my-app/src/lib/utils.ts",
+      "apps/my-app/src/lib/internal/helper.ts",
+      "apps/my-app/src/internal/helper.ts",
+      "apps/my-app/src/runtime/node.ts",
+      "apps/my-app/src/runtime/esm.ts",
+      "apps/my-app/src/runtime/fallback.ts",
+      "apps/my-app/src/runtime/browser.ts",
+      "apps/my-app/nested/lib/utils.ts",
+      "apps/web/src/lib/utils.ts",
+    ] {
+      fs::write(cwd.join(file), "export const value = 1;").unwrap();
+    }
+    (tmp, cwd)
+  }
+
+  #[test]
+  fn test_package_imports_exact_and_pattern_keys() {
+    let (_tmp, cwd) = package_imports_workspace();
+    let resolver = WorkspaceResolver::new(&cwd, vec![], vec![]);
+    let from = Path::new("apps/my-app/src/features/feature.spec.ts");
+
+    assert_eq!(
+      resolver.resolve(from, "#config"),
+      Some(PathBuf::from("apps/my-app/config/index.ts")),
+      "an exact key maps to its target, relative to the package directory"
+    );
+    assert_eq!(
+      resolver.resolve(from, "#lib/utils.ts"),
+      Some(PathBuf::from("apps/my-app/src/lib/utils.ts")),
+      "a `*` key substitutes the matched subpath into the target"
+    );
+    assert_eq!(
+      resolver.resolve(from, "#lib/internal/helper.ts"),
+      Some(PathBuf::from("apps/my-app/src/internal/helper.ts")),
+      "the key with the longest prefix before `*` wins"
+    );
+    assert_eq!(
+      resolver.resolve(from, "#unknown/thing.ts"),
+      None,
+      "a key the package does not declare resolves to nothing"
+    );
+  }
+
+  #[test]
+  fn test_package_imports_map_output_extension_to_source() {
+    let (_tmp, cwd) = package_imports_workspace();
+    let resolver = WorkspaceResolver::new(&cwd, vec![], vec![]);
+    let from = Path::new("apps/my-app/src/features/feature.spec.ts");
+
+    assert_eq!(
+      resolver.resolve(from, "#lib/utils.js"),
+      Some(PathBuf::from("apps/my-app/src/lib/utils.ts")),
+      "a `.js` target resolves to its `.ts` source, as a relative import does"
+    );
+    assert_eq!(
+      resolver.resolve(from, "#lib/utils"),
+      Some(PathBuf::from("apps/my-app/src/lib/utils.ts")),
+      "an extensionless target goes through the extension candidates"
+    );
+  }
+
+  #[test]
+  fn test_package_imports_conditional_and_array_targets() {
+    let (_tmp, cwd) = package_imports_workspace();
+    let resolver = WorkspaceResolver::new(&cwd, vec![], vec![]);
+    let from = Path::new("apps/my-app/src/features/feature.spec.ts");
+
+    assert_eq!(
+      resolver.resolve(from, "#runtime"),
+      Some(PathBuf::from("apps/my-app/src/runtime/esm.ts")),
+      "the first key in file order among the active conditions wins; `node` is not one"
+    );
+    assert_eq!(
+      resolver.resolve(from, "#runtime-fallback"),
+      Some(PathBuf::from("apps/my-app/src/runtime/fallback.ts")),
+      "an inactive condition falls through to `default`"
+    );
+    assert_eq!(
+      resolver.resolve(from, "#array"),
+      Some(PathBuf::from("apps/my-app/src/runtime/esm.ts")),
+      "an array target skips invalid entries and takes the first valid one"
+    );
+    assert_eq!(
+      resolver.resolve(from, "#external"),
+      None,
+      "a bare package target outside the workspace stays unresolved"
+    );
+  }
+
+  /// The package scope is the nearest `package.json` above the importing file, even when
+  /// an enclosing package declares the same key.
+  #[test]
+  fn test_package_imports_use_nearest_package_scope() {
+    let (_tmp, cwd) = package_imports_workspace();
+    let resolver = WorkspaceResolver::new(&cwd, vec![], vec![]);
+
+    assert_eq!(
+      resolver.resolve(Path::new("apps/my-app/nested/consumer.ts"), "#lib/utils.ts"),
+      Some(PathBuf::from("apps/my-app/nested/lib/utils.ts")),
+      "the nested package's own `imports` apply, not its parent's"
+    );
+    assert_eq!(
+      resolver.resolve(Path::new("apps/web/src/consumer.ts"), "#lib/utils.ts"),
+      None,
+      "a package without `imports` does not inherit another package's"
+    );
+  }
 }

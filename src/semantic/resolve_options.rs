@@ -140,12 +140,16 @@ pub fn create_resolve_options(cwd: &Path, projects: &[Project]) -> ResolveOption
 /// This avoids expensive filesystem I/O for external `node_modules` dependencies
 /// (e.g. `react`, `lodash`) that the resolver would attempt to resolve via
 /// `package.json` lookups before the `strip_prefix(cwd)` guard discards the result.
+///
+/// `#` specifiers are Node subpath imports, mapped by the `imports` field of the
+/// importing file's nearest `package.json`. They always qualify: the target usually sits
+/// inside that same package, and `oxc_resolver` implements the lookup natively.
 pub(crate) fn is_workspace_specifier(
   specifier: &str,
   projects: &[Project],
   tsconfig_paths: &[String],
 ) -> bool {
-  if specifier.starts_with('.') || specifier.starts_with('/') {
+  if specifier.starts_with('.') || specifier.starts_with('/') || specifier.starts_with('#') {
     return true;
   }
   let matches_prefix = |prefix: &str| {
@@ -485,6 +489,13 @@ mod tests {
   fn test_is_workspace_specifier_absolute() {
     let projects = make_projects(&["@scope/lib"]);
     assert!(is_workspace_specifier("/absolute/path", &projects, &[]));
+  }
+
+  #[test]
+  fn test_is_workspace_specifier_package_imports() {
+    let projects = make_projects(&["@scope/lib"]);
+    assert!(is_workspace_specifier("#config", &projects, &[]));
+    assert!(is_workspace_specifier("#lib/utils.ts", &projects, &[]));
   }
 
   #[test]
