@@ -3,7 +3,7 @@ mod common;
 use domino::core::{find_affected, find_affected_with_report};
 use domino::profiler::Profiler;
 use domino::report::generate_html_report;
-use domino::types::{LockfileStrategy, Project, TrueAffectedConfig};
+use domino::types::{AffectCause, LockfileStrategy, Project, TrueAffectedConfig};
 use domino::workspace;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -6097,5 +6097,162 @@ fn test_css_imported_by_package_specifier_without_exports_affects_consumer() {
     affected.contains(&"app".to_string()),
     "app imports the changed stylesheet via the package root. Got: {:?}",
     affected
+  );
+}
+
+/// Scaffold a workspace where `my-app` imports its own files through Node subpath imports
+/// (`package.json` "imports"), change one of two symbols in a module, and return every
+/// `(project, via_file)` pair reported as importing a changed symbol.
+///
+/// `my-app/nested` is its own package scope declaring the same `#lib/*` key for its own
+/// files, and `web` declares no "imports" at all, so a resolver that ignored which
+/// `package.json` owns the importing file would wire them to the changed module.
+fn package_imports_via_files() -> Vec<(String, PathBuf)> {
+  let tmp = TempDir::new().expect("Failed to create temp dir");
+  let root = tmp
+    .path()
+    .canonicalize()
+    .expect("Failed to canonicalize temp dir");
+
+  for dir in [
+    "apps/my-app/src/lib",
+    "apps/my-app/src/features",
+    "apps/my-app/nested/lib",
+    "apps/web/src",
+  ] {
+    fs::create_dir_all(root.join(dir)).unwrap();
+  }
+  fs::write(
+    root.join("apps/my-app/package.json"),
+    r##"{ "name": "my-app", "type": "module", "imports": { "#lib/*": "./src/lib/*" } }"##,
+  )
+  .unwrap();
+  fs::write(
+    root.join("apps/my-app/nested/package.json"),
+    r##"{ "name": "my-app-nested", "type": "module", "imports": { "#lib/*": "./lib/*" } }"##,
+  )
+  .unwrap();
+  fs::write(
+    root.join("apps/web/package.json"),
+    r#"{ "name": "web", "type": "module" }"#,
+  )
+  .unwrap();
+
+  fs::write(
+    root.join("apps/my-app/src/lib/helpers.ts"),
+    "export function computeValue(value: number) {\n  return value;\n}\n\nexport function unrelated(value: number) {\n  return `${value}`;\n}\n",
+  )
+  .unwrap();
+  fs::write(
+    root.join("apps/my-app/src/features/compute.spec.ts"),
+    "import { computeValue } from \"#lib/helpers.ts\";\n\nexport const computed = computeValue(1);\n",
+  )
+  .unwrap();
+  fs::write(
+    root.join("apps/my-app/src/features/compute-js.spec.ts"),
+    "import { computeValue } from \"#lib/helpers.js\";\n\nexport const computed = computeValue(2);\n",
+  )
+  .unwrap();
+  fs::write(
+    root.join("apps/my-app/src/features/unrelated.spec.ts"),
+    "import { unrelated } from \"#lib/helpers.ts\";\n\nexport const formatted = unrelated(1);\n",
+  )
+  .unwrap();
+  fs::write(
+    root.join("apps/my-app/nested/lib/helpers.ts"),
+    "export function computeValue(value: number) {\n  return -value;\n}\n",
+  )
+  .unwrap();
+  fs::write(
+    root.join("apps/my-app/nested/consumer.spec.ts"),
+    "import { computeValue } from \"#lib/helpers.ts\";\n\nexport const computed = computeValue(3);\n",
+  )
+  .unwrap();
+  fs::write(
+    root.join("apps/web/src/consumer.spec.ts"),
+    "import { computeValue } from \"#lib/helpers.ts\";\n\nexport const computed = computeValue(4);\n",
+  )
+  .unwrap();
+
+  git_in(&root, &["init"]);
+  git_in(&root, &["config", "user.email", "test@test.com"]);
+  git_in(&root, &["config", "user.name", "Test"]);
+  git_in(&root, &["branch", "-M", "main"]);
+  git_in(&root, &["add", "."]);
+  git_in(&root, &["commit", "-m", "initial"]);
+  git_in(&root, &["checkout", "-b", "feature"]);
+  fs::write(
+    root.join("apps/my-app/src/lib/helpers.ts"),
+    "export function computeValue(value: number) {\n  return value * 2;\n}\n\nexport function unrelated(value: number) {\n  return `${value}`;\n}\n",
+  )
+  .unwrap();
+  git_in(&root, &["add", "."]);
+  git_in(&root, &["commit", "-m", "modify computeValue"]);
+
+  let project = |name: &str, root: &str| Project {
+    name: name.to_string(),
+    root: PathBuf::from(root),
+    source_root: PathBuf::from(root),
+    ts_config: None,
+    implicit_dependencies: vec![],
+    targets: vec![],
+  };
+  let config = TrueAffectedConfig {
+    cwd: root.to_path_buf(),
+    base: "main".to_string(),
+    head: None,
+    projects: vec![project("my-app", "apps/my-app"), project("web", "apps/web")],
+    lockfile_strategy: LockfileStrategy::None,
+  };
+
+  let profiler = Arc::new(Profiler::new(false));
+  let report = find_affected_with_report(config, profiler)
+    .expect("find_affected_with_report failed")
+    .report
+    .expect("expected a report");
+
+  report
+    .projects
+    .iter()
+    .flat_map(|project| {
+      project.causes.iter().filter_map(|cause| match cause {
+        AffectCause::ImportedSymbol { via_file, .. } => {
+          Some((project.name.clone(), via_file.clone()))
+        }
+        _ => None,
+      })
+    })
+    .collect()
+}
+
+#[test]
+fn test_package_imports_symbol_change_reaches_importing_spec() {
+  let via_files = package_imports_via_files();
+  let has = |file: &str| via_files.iter().any(|(_, via)| via == Path::new(file));
+
+  assert!(
+    has("apps/my-app/src/features/compute.spec.ts"),
+    "a spec importing the changed symbol through `#lib/*` is affected. Got: {:?}",
+    via_files
+  );
+  assert!(
+    has("apps/my-app/src/features/compute-js.spec.ts"),
+    "a `#lib/*.js` import resolves to the `.ts` source. Got: {:?}",
+    via_files
+  );
+  assert!(
+    !has("apps/my-app/src/features/unrelated.spec.ts"),
+    "a spec importing only an unchanged symbol of the same module is not affected. Got: {:?}",
+    via_files
+  );
+  assert!(
+    !has("apps/my-app/nested/consumer.spec.ts"),
+    "the nested package's `#lib/*` maps to its own module. Got: {:?}",
+    via_files
+  );
+  assert!(
+    !via_files.iter().any(|(project, _)| project == "web"),
+    "a package without `imports` does not resolve `#` specifiers. Got: {:?}",
+    via_files
   );
 }
