@@ -1,3 +1,4 @@
+fix(resolve): resolve package.json "imports" subpath specifiers | not submitted
 chore(fork): list the asset specifier patch in the manifest | fork-only
 fix(core): affect every project when lockfile analysis fails | not submitted
 fix(lockfile): read pnpm v9 dependencies from snapshots | not submitted
