@@ -3613,6 +3613,8 @@ fn pnpm_two_documents(left_pad: &str, repeat: &str) -> String {
   pnpm_env_document("12.10.1") + &pnpm_workspace_document(left_pad, repeat)
 }
 
+const UNPARSEABLE_PNPM_LOCKFILE: &str = "lockfileVersion: '9.0'\npackages: [unterminated\n";
+
 /// Commits `base_lockfile` on `main` and leaves `feature` checked out on top of it.
 fn setup_pnpm_repo(base_lockfile: &str) -> (TempDir, PathBuf) {
   let tmp = TempDir::new().expect("Failed to create temp dir");
@@ -3752,6 +3754,69 @@ fn test_pnpm_transitive_bump_two_documents() {
   commit_pnpm_lockfile(&root, &pnpm_two_documents("1.0.0", "1.1.0"));
 
   assert_eq!(pnpm_full_affected(&root), ["a", "b"]);
+}
+
+#[test]
+fn test_unparseable_head_lockfile_affects_every_project() {
+  let (_tmp, root) = setup_pnpm_repo(&pnpm_two_documents("1.0.0", "1.0.0"));
+  commit_pnpm_lockfile(&root, UNPARSEABLE_PNPM_LOCKFILE);
+
+  assert_eq!(pnpm_full_affected(&root), ["a", "b", "c"]);
+}
+
+#[test]
+fn test_unparseable_base_lockfile_affects_every_project() {
+  let (_tmp, root) = setup_pnpm_repo(UNPARSEABLE_PNPM_LOCKFILE);
+  commit_pnpm_lockfile(&root, &pnpm_two_documents("1.0.0", "1.0.0"));
+
+  assert_eq!(pnpm_full_affected(&root), ["a", "b", "c"]);
+}
+
+#[test]
+fn test_failed_lockfile_analysis_is_reported_as_a_global_trigger() {
+  let (_tmp, root) = setup_pnpm_repo(&pnpm_two_documents("1.0.0", "1.0.0"));
+  commit_pnpm_lockfile(&root, UNPARSEABLE_PNPM_LOCKFILE);
+
+  let report = find_affected_with_report(pnpm_full_config(&root), Arc::new(Profiler::new(false)))
+    .expect("find_affected_with_report failed")
+    .report
+    .expect("expected a report");
+
+  assert_eq!(report.global_triggers.len(), 1);
+  assert_eq!(
+    report.global_triggers[0].file,
+    PathBuf::from("pnpm-lock.yaml")
+  );
+  assert_eq!(report.totals.globally_invalidated, 3);
+}
+
+/// CI runs `--json --ci > domino-projects.json`: the warning has to survive `--ci` and
+/// must not land in the JSON, and tracing would fail one or the other.
+#[test]
+fn test_failed_lockfile_analysis_warns_on_stderr_and_keeps_json_clean() {
+  let (_tmp, root) = setup_pnpm_repo(&pnpm_two_documents("1.0.0", "1.0.0"));
+  commit_pnpm_lockfile(&root, UNPARSEABLE_PNPM_LOCKFILE);
+
+  let output = Command::new(env!("CARGO_BIN_EXE_domino"))
+    .args([
+      "affected",
+      "--base",
+      "main",
+      "--lockfile-strategy",
+      "full",
+      "--json",
+      "--ci",
+    ])
+    .current_dir(&root)
+    .output()
+    .expect("Failed to run domino");
+
+  assert!(output.status.success());
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let affected: Vec<String> =
+    serde_json::from_str(stdout.trim()).expect("stdout should be a JSON array");
+  assert_eq!(affected, ["a", "b", "c"]);
+  assert!(String::from_utf8_lossy(&output.stderr).contains("Lockfile analysis failed"));
 }
 
 /// Verifies that files excluded by a project's tsconfig (e.g. `*.stories.tsx`)
