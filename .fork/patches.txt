@@ -1,3 +1,4 @@
+fix(lockfile): parse the last document of a pnpm lockfile | upstream#105
 chore(fork): automate releases and the upstream rebase | fork-only
 fix(semantic): resolve project tsconfig paths aliases | upstream#95
 fix(semantic): cascade the default export through dynamic imports | not submitted

@@ -3535,6 +3535,209 @@ fn test_lockfile_no_change_zero_impact() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// pnpm lockfile analysis: `a` imports `left-pad`, `b` imports `a`, `c` imports nothing.
+// ---------------------------------------------------------------------------
+
+/// pnpm leads the lockfile with this document once `packageManager` pins it.
+fn pnpm_env_document(pnpm_version: &str) -> String {
+  format!(
+    r#"---
+lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    configDependencies: {{}}
+    packageManagerDependencies:
+      pnpm:
+        specifier: {pnpm_version}
+        version: {pnpm_version}
+
+packages:
+
+  pnpm@{pnpm_version}:
+    resolution: {{integrity: sha512-pnpm}}
+    hasBin: true
+
+snapshots:
+
+  pnpm@{pnpm_version}: {{}}
+---
+"#
+  )
+}
+
+fn pnpm_workspace_document(left_pad: &str, repeat: &str) -> String {
+  format!(
+    r#"lockfileVersion: '9.0'
+
+importers:
+
+  .: {{}}
+
+  packages/a:
+    dependencies:
+      left-pad:
+        specifier: ^1.0.0
+        version: {left_pad}
+
+  packages/b:
+    dependencies:
+      a:
+        specifier: workspace:*
+        version: link:../a
+
+  packages/c: {{}}
+
+packages:
+
+  left-pad@{left_pad}:
+    resolution: {{integrity: sha512-left-pad}}
+
+  repeat@{repeat}:
+    resolution: {{integrity: sha512-repeat}}
+
+snapshots:
+
+  left-pad@{left_pad}:
+    dependencies:
+      repeat: {repeat}
+
+  repeat@{repeat}: {{}}
+"#
+  )
+}
+
+fn pnpm_two_documents(left_pad: &str, repeat: &str) -> String {
+  pnpm_env_document("12.10.1") + &pnpm_workspace_document(left_pad, repeat)
+}
+
+/// Commits `base_lockfile` on `main` and leaves `feature` checked out on top of it.
+fn setup_pnpm_repo(base_lockfile: &str) -> (TempDir, PathBuf) {
+  let tmp = TempDir::new().expect("Failed to create temp dir");
+  let root = tmp
+    .path()
+    .canonicalize()
+    .expect("Failed to canonicalize temp dir");
+
+  let files = [
+    (
+      "nx.json",
+      r#"{"namedInputs":{"default":["{projectRoot}/**/*","{workspaceRoot}/package.json"]}}"#,
+    ),
+    (
+      "package.json",
+      r#"{"name":"root","private":true,"devDependencies":{"x":"1"}}"#,
+    ),
+    ("pnpm-workspace.yaml", "packages:\n  - packages/*\n"),
+    (
+      "tsconfig.base.json",
+      r#"{"compilerOptions":{"baseUrl":".","paths":{"a":["packages/a/src/index.ts"],"b":["packages/b/src/index.ts"]}}}"#,
+    ),
+    (
+      "packages/a/project.json",
+      r#"{"name":"a","sourceRoot":"packages/a/src"}"#,
+    ),
+    (
+      "packages/a/src/index.ts",
+      "import leftPad from \"left-pad\";\nexport const pad = (value: string): string => leftPad(value, 2);\n",
+    ),
+    (
+      "packages/b/project.json",
+      r#"{"name":"b","sourceRoot":"packages/b/src"}"#,
+    ),
+    (
+      "packages/b/src/index.ts",
+      "import { pad } from \"a\";\nexport const run = (): string => pad(\"x\");\n",
+    ),
+    (
+      "packages/c/project.json",
+      r#"{"name":"c","sourceRoot":"packages/c/src"}"#,
+    ),
+    (
+      "packages/c/src/index.ts",
+      "export const standalone = (): string => \"c\";\n",
+    ),
+    ("pnpm-lock.yaml", base_lockfile),
+  ];
+  for (path, content) in files {
+    let path = root.join(path);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, content).unwrap();
+  }
+
+  git_in(&root, &["init"]);
+  git_in(&root, &["config", "user.email", "test@test.com"]);
+  git_in(&root, &["config", "user.name", "Test"]);
+  git_in(&root, &["branch", "-M", "main"]);
+  git_in(&root, &["add", "."]);
+  git_in(&root, &["commit", "-m", "initial"]);
+  git_in(&root, &["checkout", "-b", "feature"]);
+
+  (tmp, root)
+}
+
+fn commit_pnpm_lockfile(root: &Path, lockfile: &str) {
+  fs::write(root.join("pnpm-lock.yaml"), lockfile).unwrap();
+  git_in(root, &["add", "."]);
+  git_in(root, &["commit", "-m", "lockfile"]);
+}
+
+fn pnpm_full_config(root: &Path) -> TrueAffectedConfig {
+  TrueAffectedConfig {
+    cwd: root.to_path_buf(),
+    base: "main".to_string(),
+    head: None,
+    projects: workspace::discover_projects(root).expect("Failed to discover projects"),
+    lockfile_strategy: LockfileStrategy::Full,
+  }
+}
+
+fn pnpm_full_affected(root: &Path) -> Vec<String> {
+  find_affected(pnpm_full_config(root), Arc::new(Profiler::new(false)))
+    .expect("find_affected failed")
+    .affected_projects
+}
+
+#[test]
+fn test_pnpm_direct_bump_single_document() {
+  let (_tmp, root) = setup_pnpm_repo(&pnpm_workspace_document("1.0.0", "1.0.0"));
+  commit_pnpm_lockfile(&root, &pnpm_workspace_document("2.0.0", "1.0.0"));
+
+  assert_eq!(pnpm_full_affected(&root), ["a", "b"]);
+}
+
+#[test]
+fn test_pnpm_direct_bump_two_documents() {
+  let (_tmp, root) = setup_pnpm_repo(&pnpm_two_documents("1.0.0", "1.0.0"));
+  commit_pnpm_lockfile(&root, &pnpm_two_documents("2.0.0", "1.0.0"));
+
+  assert_eq!(pnpm_full_affected(&root), ["a", "b"]);
+}
+
+#[test]
+fn test_pnpm_direct_bump_with_root_package_json_two_documents() {
+  let (_tmp, root) = setup_pnpm_repo(&pnpm_two_documents("1.0.0", "1.0.0"));
+  fs::write(
+    root.join("package.json"),
+    r#"{"name":"root","private":true,"devDependencies":{"x":"2"}}"#,
+  )
+  .unwrap();
+  commit_pnpm_lockfile(&root, &pnpm_two_documents("2.0.0", "1.0.0"));
+
+  assert_eq!(pnpm_full_affected(&root), ["a", "b"]);
+}
+
+#[test]
+fn test_pnpm_env_document_change_alone_affects_nothing() {
+  let (_tmp, root) = setup_pnpm_repo(&pnpm_two_documents("1.0.0", "1.0.0"));
+  let lockfile = pnpm_env_document("12.11.0") + &pnpm_workspace_document("1.0.0", "1.0.0");
+  commit_pnpm_lockfile(&root, &lockfile);
+
+  assert!(pnpm_full_affected(&root).is_empty());
+}
+
 /// Verifies that files excluded by a project's tsconfig (e.g. `*.stories.tsx`)
 /// do NOT cause that project to be marked as affected, even when a transitive
 /// type dependency chain reaches the excluded file.
