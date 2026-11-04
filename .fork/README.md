@@ -28,6 +28,7 @@ for a patch silently dropped during an automated rebase.
 
 | Patch | Upstream PR | State |
 | --- | --- | --- |
+| `fix(core): affect every project when lockfile analysis fails` | not submitted | worth sending; upstream still logs the failure at `debug` and carries on |
 | `fix(lockfile): read pnpm v9 dependencies from snapshots` | not submitted | worth sending; upstream's parser still reads `packages` only |
 | `fix(lockfile): reject a pnpm lockfile that is not a mapping` | not submitted | worth sending; upstream's parser still reads such a file as an empty package list |
 | `chore(fork): automate releases and the upstream rebase` | fork-only | — |
@@ -37,8 +38,9 @@ for a patch silently dropped during an automated rebase.
 | `ci(fork): allow manual dispatch and disable the npm publish job` | fork-only | — |
 
 Keep the PR column current: it is the difference between "we chose to carry this" and "we
-forgot to send it". Only one patch is still unsubmitted; upstream has already touched the
-same code in `upstream#12` and `upstream#69`, which is where a submission should build from.
+forgot to send it". The dynamic-import cascade is unsubmitted, and upstream has already touched the same code in
+`upstream#12` and `upstream#69`, which is where a submission should build from. The `snapshots`
+and fail-closed lockfile patches are unsubmitted and have no upstream equivalent.
 
 The cheapest maintenance is deletion, but note how upstream has actually absorbed fork work
 so far: `upstream#75` and `upstream#77` were both superseded by upstream's own

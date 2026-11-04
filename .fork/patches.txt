@@ -1,3 +1,4 @@
+fix(core): affect every project when lockfile analysis fails | not submitted
 fix(lockfile): read pnpm v9 dependencies from snapshots | not submitted
 fix(lockfile): reject a pnpm lockfile that is not a mapping | not submitted
 chore(fork): automate releases and the upstream rebase | fork-only
