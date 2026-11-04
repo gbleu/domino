@@ -134,7 +134,8 @@ fn find_affected_internal(
   // being silently dropped
   // (which would flip all → 0 — the same under-inclusion the package.json guard
   // prevents). Any *other* global trigger (.nvmrc, nx.json, ...) always
-  // invalidates every project.
+  // invalidates every project. If the analysis then fails, Step 5c adds a global
+  // trigger back.
   let lockfile_analysis_enabled = !matches!(config.lockfile_strategy, LockfileStrategy::None);
   let mut global_triggers: Vec<GlobalTrigger> = if let Some(ref inputs) = resolved_inputs {
     named_inputs::check_global_invalidation(inputs, &changed_files)
@@ -708,7 +709,22 @@ fn find_affected_internal(
             }
           }
           Ok(_) => debug!("Lockfile changed but no dependency versions differ"),
-          Err(e) => debug!("Lockfile analysis failed, skipping: {}", e),
+          // Nothing else bounds what this diff reaches: the manifests left the global
+          // triggers in Step 1b so that this step could answer for them. eprintln, because
+          // `--ci` and `--json` silence tracing below error and tracing writes to stdout,
+          // where CI captures the JSON.
+          Err(e) => {
+            eprintln!(
+              "Lockfile analysis failed, treating every project as affected: {}",
+              e
+            );
+            let lockfile = lockfile::lockfile_name(pm);
+            global_triggers.push(GlobalTrigger {
+              file: PathBuf::from(lockfile),
+              named_input: "lockfile analysis failed".to_string(),
+              raw_pattern: lockfile.to_string(),
+            });
+          }
         }
       }
     }
