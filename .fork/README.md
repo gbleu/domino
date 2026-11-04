@@ -28,6 +28,7 @@ for a patch silently dropped during an automated rebase.
 
 | Patch | Upstream PR | State |
 | --- | --- | --- |
+| `fix(lockfile): read pnpm v9 dependencies from snapshots` | not submitted | worth sending; upstream's parser still reads `packages` only |
 | `fix(lockfile): reject a pnpm lockfile that is not a mapping` | not submitted | worth sending; upstream's parser still reads such a file as an empty package list |
 | `chore(fork): automate releases and the upstream rebase` | fork-only | — |
 | `fix(semantic): resolve project tsconfig paths aliases` | `upstream#95` | open; absent from upstream `main` |
