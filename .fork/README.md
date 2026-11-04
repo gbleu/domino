@@ -28,9 +28,11 @@ for a patch silently dropped during an automated rebase.
 
 | Patch | Upstream PR | State |
 | --- | --- | --- |
+| `chore(fork): list the asset specifier patch in the manifest` | fork-only | — |
 | `fix(core): affect every project when lockfile analysis fails` | not submitted | worth sending; upstream still logs the failure at `debug` and carries on |
 | `fix(lockfile): read pnpm v9 dependencies from snapshots` | not submitted | worth sending; upstream's parser still reads `packages` only |
 | `fix(lockfile): reject a pnpm lockfile that is not a mapping` | not submitted | worth sending; upstream's parser still reads such a file as an empty package list |
+| `feat: resolve bare package specifiers for asset references (#5)` | not submitted | no upstream equivalent at `v2.2.0` |
 | `chore(fork): automate releases and the upstream rebase` | fork-only | — |
 | `fix(semantic): resolve project tsconfig paths aliases` | `upstream#95` | open; absent from upstream `main` |
 | `fix(semantic): cascade the default export through dynamic imports` | not submitted | prior art: `upstream#12`, `upstream#69` |
@@ -39,8 +41,8 @@ for a patch silently dropped during an automated rebase.
 
 Keep the PR column current: it is the difference between "we chose to carry this" and "we
 forgot to send it". The dynamic-import cascade is unsubmitted, and upstream has already touched the same code in
-`upstream#12` and `upstream#69`, which is where a submission should build from. The `snapshots`
-and fail-closed lockfile patches are unsubmitted and have no upstream equivalent.
+`upstream#12` and `upstream#69`, which is where a submission should build from. The `snapshots`,
+fail-closed lockfile and bare-specifier asset patches are unsubmitted and have no upstream equivalent.
 
 The cheapest maintenance is deletion, but note how upstream has actually absorbed fork work
 so far: `upstream#75` and `upstream#77` were both superseded by upstream's own
