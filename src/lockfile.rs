@@ -466,15 +466,7 @@ fn parse_pnpm_lockfile(content: &str) -> Result<LockfileData> {
         }
 
         let mut deps = FxHashMap::default();
-        for dep_key in &yaml_pkg_dep_keys {
-          if let Some(d) = val.get(dep_key).and_then(|v| v.as_mapping()) {
-            for (name, ver) in d {
-              if let (Some(n), Some(v)) = (name.as_str(), ver.as_str()) {
-                deps.insert(n.to_string(), v.to_string());
-              }
-            }
-          }
-        }
+        collect_pnpm_dependencies(val, &yaml_pkg_dep_keys, &mut deps);
 
         // Use the original lockfile key to preserve uniqueness when the same
         // package appears at multiple versions (e.g. /foo@1.0.0 and /foo@2.0.0).
@@ -495,11 +487,42 @@ fn parse_pnpm_lockfile(content: &str) -> Result<LockfileData> {
     }
   }
 
+  // Lockfile v9 keeps dependencies in `snapshots`, one entry per resolved peer set:
+  // `foo@1.0.0(bar@2.0.0)`. They fold onto the `packages` key so a peer-only change does not
+  // read as a new package in the version diff, while its dependencies still reach the graph.
+  if let Some(snapshots) = parsed.get("snapshots").and_then(|v| v.as_mapping()) {
+    for (key, val) in snapshots {
+      let Some(key_str) = key.as_str() else {
+        continue;
+      };
+      let package_key = key_str.split('(').next().unwrap_or(key_str);
+      if let Some(info) = packages.get_mut(package_key) {
+        collect_pnpm_dependencies(val, &yaml_pkg_dep_keys, &mut info.dependencies);
+      }
+    }
+  }
+
   Ok(LockfileData {
     direct_dependencies,
     packages,
     integrity_scope: None,
   })
+}
+
+fn collect_pnpm_dependencies(
+  entry: &serde_yaml::Value,
+  dep_keys: &[serde_yaml::Value],
+  deps: &mut FxHashMap<String, String>,
+) {
+  for dep_key in dep_keys {
+    if let Some(d) = entry.get(dep_key).and_then(|v| v.as_mapping()) {
+      for (name, ver) in d {
+        if let (Some(n), Some(v)) = (name.as_str(), ver.as_str()) {
+          deps.insert(n.to_string(), v.to_string());
+        }
+      }
+    }
+  }
 }
 
 /// pnpm 10 writes `pnpm-lock.yaml` as two YAML documents. The first is the
@@ -1846,6 +1869,97 @@ packages:
     assert!(data.direct_dependencies.contains("left-pad"));
     assert!(!data.direct_dependencies.contains("pnpm"));
     assert!(data.packages.contains_key("left-pad@1.0.0"));
+  }
+
+  #[test]
+  fn test_parse_pnpm_lockfile_folds_snapshots_onto_packages() {
+    let content = r#"lockfileVersion: '9.0'
+importers:
+  packages/a:
+    dependencies:
+      foo:
+        specifier: ^1.0.0
+        version: 1.0.0(peer@1.0.0)
+packages:
+  foo@1.0.0:
+    resolution: {integrity: sha512-foo}
+  bar@2.0.0:
+    resolution: {integrity: sha512-bar}
+snapshots:
+  foo@1.0.0(peer@1.0.0):
+    dependencies:
+      bar: 2.0.0
+  foo@1.0.0(peer@2.0.0):
+    optionalDependencies:
+      baz: 3.0.0(peer@2.0.0)
+  bar@2.0.0: {}
+"#;
+
+    let data = parse_pnpm_lockfile(content).unwrap();
+
+    assert_eq!(data.packages.len(), 2);
+    let foo = &data.packages["foo@1.0.0"];
+    assert_eq!(foo.version, "1.0.0");
+    assert_eq!(foo.dependencies["bar"], "2.0.0");
+    assert!(foo.dependencies.contains_key("baz"));
+    let reverse = build_reverse_dep_graph(&data);
+    assert!(reverse["bar"].contains("foo"));
+    assert!(reverse["baz"].contains("foo"));
+  }
+
+  #[test]
+  fn test_pnpm_peer_only_snapshot_change_is_not_a_package_change() {
+    let lockfile = |peer: &str| {
+      format!(
+        r#"lockfileVersion: '9.0'
+packages:
+  foo@1.0.0:
+    resolution: {{integrity: sha512-foo}}
+snapshots:
+  foo@1.0.0(peer@{peer}): {{}}
+"#
+      )
+    };
+
+    let previous = parse_pnpm_lockfile(&lockfile("1.0.0")).unwrap();
+    let current = parse_pnpm_lockfile(&lockfile("2.0.0")).unwrap();
+
+    assert!(diff_lockfile_packages(&current.packages, &previous.packages).is_empty());
+  }
+
+  #[test]
+  fn test_pnpm_transitive_change_resolves_through_snapshots() {
+    let lockfile = |nested: &str| {
+      format!(
+        r#"lockfileVersion: '9.0'
+importers:
+  packages/a:
+    dependencies:
+      foo:
+        specifier: ^1.0.0
+        version: 1.0.0
+packages:
+  foo@1.0.0:
+    resolution: {{integrity: sha512-foo}}
+  nested@{nested}:
+    resolution: {{integrity: sha512-nested}}
+snapshots:
+  foo@1.0.0:
+    dependencies:
+      nested: {nested}
+  nested@{nested}: {{}}
+"#
+      )
+    };
+
+    let previous = parse_pnpm_lockfile(&lockfile("1.0.0")).unwrap();
+    let current = parse_pnpm_lockfile(&lockfile("1.1.0")).unwrap();
+    let changed = diff_lockfile_packages(&current.packages, &previous.packages);
+    let reverse = build_reverse_dep_graph(&current);
+
+    let direct = resolve_to_direct_deps(&changed, &reverse, &current.direct_dependencies);
+
+    assert_eq!(direct.into_iter().collect::<Vec<_>>(), ["foo"]);
   }
 
   // --- yarn parsing ---

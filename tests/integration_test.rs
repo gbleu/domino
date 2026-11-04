@@ -3903,6 +3903,22 @@ fn test_pnpm_env_document_change_alone_affects_nothing() {
   assert!(pnpm_full_affected(&root).is_empty());
 }
 
+#[test]
+fn test_pnpm_transitive_bump_single_document() {
+  let (_tmp, root) = setup_pnpm_repo(&pnpm_workspace_document("1.0.0", "1.0.0"));
+  commit_pnpm_lockfile(&root, &pnpm_workspace_document("1.0.0", "1.1.0"));
+
+  assert_eq!(pnpm_full_affected(&root), ["a", "b"]);
+}
+
+#[test]
+fn test_pnpm_transitive_bump_two_documents() {
+  let (_tmp, root) = setup_pnpm_repo(&pnpm_two_documents("1.0.0", "1.0.0"));
+  commit_pnpm_lockfile(&root, &pnpm_two_documents("1.0.0", "1.1.0"));
+
+  assert_eq!(pnpm_full_affected(&root), ["a", "b"]);
+}
+
 /// Verifies that files excluded by a project's tsconfig (e.g. `*.stories.tsx`)
 /// do NOT cause that project to be marked as affected, even when a transitive
 /// type dependency chain reaches the excluded file.
