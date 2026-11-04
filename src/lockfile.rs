@@ -8,6 +8,7 @@ use crate::error::{DominoError, Result};
 use crate::types::ChangedFile;
 use regex::Regex;
 use rustc_hash::{FxHashMap, FxHashSet};
+use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -397,8 +398,7 @@ fn package_name_from_key(key: &str) -> &str {
 }
 
 fn parse_pnpm_lockfile(content: &str) -> Result<LockfileData> {
-  let parsed: serde_yaml::Value = serde_yaml::from_str(content)
-    .map_err(|e| DominoError::Parse(format!("pnpm lockfile: {}", e)))?;
+  let parsed = last_pnpm_document(content)?;
 
   let mut direct_dependencies = FxHashSet::default();
   let mut packages = FxHashMap::default();
@@ -468,6 +468,21 @@ fn parse_pnpm_lockfile(content: &str) -> Result<LockfileData> {
     direct_dependencies,
     packages,
   })
+}
+
+/// Once `packageManager` pins pnpm, the lockfile leads with a document describing pnpm's own
+/// install; the last document is the workspace's. A lockfile without a mapping there has no
+/// importers or packages to read, and answering from that would report nothing changed.
+fn last_pnpm_document(content: &str) -> Result<serde_yaml::Value> {
+  let mut last = None;
+  for document in serde_yaml::Deserializer::from_str(content) {
+    let value = serde_yaml::Value::deserialize(document)
+      .map_err(|e| DominoError::Parse(format!("pnpm lockfile: {}", e)))?;
+    last = Some(value);
+  }
+  last
+    .filter(serde_yaml::Value::is_mapping)
+    .ok_or_else(|| DominoError::Parse("pnpm lockfile: last document is not a mapping".into()))
 }
 
 fn parse_pnpm_package_key(key: &str) -> (String, String) {
@@ -1576,6 +1591,44 @@ packages:
   fn test_parse_pnpm_lockfile_invalid_yaml() {
     let result = parse_pnpm_lockfile("{\n\t- invalid:\n\t\t- [mixed");
     assert!(result.is_err());
+  }
+
+  #[test]
+  fn test_parse_pnpm_lockfile_without_a_mapping_is_an_error() {
+    assert!(parse_pnpm_lockfile("").is_err());
+    assert!(parse_pnpm_lockfile("not a lockfile").is_err());
+  }
+
+  #[test]
+  fn test_parse_pnpm_lockfile_reads_the_last_document() {
+    let content = r#"---
+lockfileVersion: '9.0'
+importers:
+  .:
+    packageManagerDependencies:
+      pnpm:
+        specifier: 12.10.1
+        version: 12.10.1
+packages:
+  pnpm@12.10.1: {}
+---
+lockfileVersion: '9.0'
+importers:
+  packages/a:
+    dependencies:
+      left-pad:
+        specifier: ^1.0.0
+        version: 1.0.0
+packages:
+  left-pad@1.0.0: {}
+"#;
+
+    let data = parse_pnpm_lockfile(content).unwrap();
+
+    assert!(data.direct_dependencies.contains("left-pad"));
+    assert!(!data.direct_dependencies.contains("pnpm"));
+    assert!(data.packages.contains_key("left-pad@1.0.0"));
+    assert!(!data.packages.contains_key("pnpm@12.10.1"));
   }
 
   // --- yarn parsing ---
