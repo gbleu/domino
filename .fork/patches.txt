@@ -1,6 +1,8 @@
+chore(fork): list the asset specifier patch in the manifest | fork-only
 fix(core): affect every project when lockfile analysis fails | not submitted
 fix(lockfile): read pnpm v9 dependencies from snapshots | not submitted
 fix(lockfile): parse the last document of a pnpm lockfile | upstream#105
+feat: resolve bare package specifiers for asset references (#5) | not submitted
 chore(fork): automate releases and the upstream rebase | fork-only
 fix(semantic): resolve project tsconfig paths aliases | upstream#95
 fix(semantic): cascade the default export through dynamic imports | not submitted
