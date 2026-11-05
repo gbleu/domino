@@ -1,3 +1,4 @@
+fix(git): keep the old side of replacement hunks | not submitted
 fix(semantic): treat re-exports as loading the module for side-effect changes | not submitted
 fix(semantic): carry side-effect changes through importers without exports | not submitted
 fix(semantic): propagate side-effect imports and top-level side-effect changes | not submitted
