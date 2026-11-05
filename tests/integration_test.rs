@@ -8338,6 +8338,37 @@ fn test_side_effect_imports_chain() {
   );
 }
 
+#[test]
+fn test_side_effect_change_crosses_export_less_binding_importer() {
+  let via_files = side_effect_via_files(
+    &[
+      (
+        "setup.ts",
+        "export function setup() {\n  return true;\n}\n\nconsole.log(\"setup\");\n",
+      ),
+      (
+        "bridge.ts",
+        "import { setup } from \"./setup\";\n\nfunction init() {\n  return setup();\n}\n",
+      ),
+      (
+        "app.ts",
+        "import * as bridge from \"./bridge\";\n\nvoid bridge;\n\nexport function app() {\n  return true;\n}\n",
+      ),
+      ("app.spec.ts", "import { app } from \"./app\";\n\napp();\n"),
+    ],
+    &[(
+      "setup.ts",
+      Some("export function setup() {\n  return true;\n}\n\nconsole.log(\"setup v2\");\n"),
+    )],
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&["app.spec.ts", "app.ts", "bridge.ts"]),
+    "loading an importer without exports still runs the changed side effects of what it imports"
+  );
+}
+
 /// The polyfills pattern: an export-less `polyfills/index.ts` only loads each
 /// polyfill for its side effects, `setup.ts` reaches the index through a
 /// namespace import used in top-level code only, and `main.ts` loads `setup.ts`
