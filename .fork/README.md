@@ -32,6 +32,7 @@ exempt: they land by force-push, and their commits against `main` are upstream's
 
 | Patch | Upstream PR | State |
 | --- | --- | --- |
+| `fix(semantic): propagate side-effect imports and top-level side-effect changes` | not submitted | worth sending; addresses upstream #103, still open at `v2.2.0` |
 | `ci(fork): delete the previews of closed pull requests` | fork-only | — |
 | `ci(fork): fail a pull request whose commits are not in the manifest` | fork-only | — |
 | `chore(fork): stop the sync on conflicts in merge=union files` | fork-only | — |
