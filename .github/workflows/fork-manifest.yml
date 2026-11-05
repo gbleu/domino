@@ -1,0 +1,38 @@
+name: Fork Manifest
+
+# Upstream Sync rejects main when its top commits differ from .fork/patches.txt, and that
+# only surfaces at its next Monday run. This fails the missing line while the PR is open.
+'on':
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  manifest:
+    name: Verify the commits are in the manifest
+    # A sync branch lands by force-push, and its commits against main are upstream's.
+    if: ${{ !startsWith(github.head_ref, 'sync/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The default is a synthetic merge commit, which is not what lands on main.
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Compare the commits with the top of the manifest
+        run: |
+          set -euo pipefail
+          # The branch tip rather than the event's base SHA: a re-run replays the old SHA,
+          # which a sync's force-push leaves unreachable. No merges, since a rebase-merge
+          # drops them and only the rest reach main.
+          git log --format=%s --no-merges "origin/$GITHUB_BASE_REF..HEAD" > /tmp/pr-commits.txt
+          count=$(wc -l < /tmp/pr-commits.txt)
+          head -n "$count" .fork/patches.txt | sed 's/[[:space:]]*|.*$//' > /tmp/expected-patches.txt
+          if ! diff -u /tmp/expected-patches.txt /tmp/pr-commits.txt; then
+            echo "::error::This PR's commits are not the top lines of .fork/patches.txt (see diff above)"
+            echo "List each commit at the top of .fork/patches.txt, newest first, as"
+            echo "'<commit subject> | <upstream PR>', and add its row to the table in .fork/README.md."
+            exit 1
+          fi

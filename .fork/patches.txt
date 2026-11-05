@@ -1,3 +1,4 @@
+ci(fork): fail a pull request whose commits are not in the manifest | fork-only
 chore(fork): stop the sync on conflicts in merge=union files | fork-only
 fix(resolve): resolve package.json "imports" subpath specifiers | not submitted
 chore(fork): list the asset specifier patch in the manifest | fork-only
