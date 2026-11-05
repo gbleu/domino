@@ -8369,6 +8369,37 @@ fn test_side_effect_change_crosses_export_less_binding_importer() {
   );
 }
 
+#[test]
+fn test_side_effect_change_reaches_consumers_of_reexporting_barrel() {
+  let via_files = side_effect_via_files(
+    &[
+      (
+        "widget.ts",
+        "export function widget() {\n  return true;\n}\n\nconsole.log(\"widget\");\n",
+      ),
+      (
+        "index.ts",
+        "export { widget } from \"./widget\";\n\nexport const ready = true;\n",
+      ),
+      (
+        "app.ts",
+        "import { ready } from \"./index\";\n\nexport function app() {\n  return ready;\n}\n",
+      ),
+      ("app.spec.ts", "import { app } from \"./app\";\n\napp();\n"),
+    ],
+    &[(
+      "widget.ts",
+      Some("export function widget() {\n  return true;\n}\n\nconsole.log(\"widget v2\");\n"),
+    )],
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&["app.spec.ts", "app.ts", "index.ts"]),
+    "a barrel re-exporting a module loads it, so its consumers run the changed side effects"
+  );
+}
+
 /// The polyfills pattern: an export-less `polyfills/index.ts` only loads each
 /// polyfill for its side effects, `setup.ts` reaches the index through a
 /// namespace import used in top-level code only, and `main.ts` loads `setup.ts`
