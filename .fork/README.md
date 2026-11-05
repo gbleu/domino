@@ -32,6 +32,7 @@ exempt: they land by force-push, and their commits against `main` are upstream's
 
 | Patch | Upstream PR | State |
 | --- | --- | --- |
+| `ci(fork): delete the previews of closed pull requests` | fork-only | — |
 | `ci(fork): fail a pull request whose commits are not in the manifest` | fork-only | — |
 | `chore(fork): stop the sync on conflicts in merge=union files` | fork-only | — |
 | `fix(resolve): resolve package.json "imports" subpath specifiers` | not submitted | worth sending; upstream's `is_workspace_specifier` still drops `#` specifiers |
@@ -118,6 +119,11 @@ then picks up those artifacts and publishes a GitHub release tagged
 `fork-v<upstream-version>-<n>` with the per-target `domino-<target>` executables, the
 `.node` bindings and `SHA256SUMS`. It is the push-side twin of `preview-release.yml`, which
 does the same for pull requests.
+
+`fork-preview-cleanup.yml` deletes those previews. Upstream's `cleanup-preview-release.yml` only
+runs in upstream's repository and only at close, which misses a PR merged before its CI ends,
+since that PR publishes its preview afterwards. The fork's workflow also runs after each
+preview run, whatever its outcome, and sweeps every preview whose PR is no longer open.
 
 Upstream's own `publish` job in `CI.yml` is disabled with `if: false` rather than deleted, so
 upstream's edits to it keep applying cleanly. Nothing is published to npm.
