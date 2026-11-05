@@ -1,3 +1,4 @@
+fix(semantic): carry side-effect changes through importers without exports | not submitted
 fix(semantic): propagate side-effect imports and top-level side-effect changes | not submitted
 ci(fork): delete the previews of closed pull requests | fork-only
 ci(fork): fail a pull request whose commits are not in the manifest | fork-only

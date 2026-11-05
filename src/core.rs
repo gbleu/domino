@@ -1456,13 +1456,29 @@ fn process_side_effect_change(
       importing_file, file_path
     );
     record_whole_module_dependent(project_index, importing_file, file_path, state);
-    process_changed_file(
-      analyzer,
-      reference_finder,
-      importing_file,
-      project_index,
-      state,
-    )?;
+    // An importer without exports has nothing to trace, yet whatever loads it
+    // still runs the changed side effects: carry the change through it.
+    let exports_nothing = analyzer
+      .exports
+      .get(importing_file)
+      .is_none_or(|exports| exports.is_empty());
+    if exports_nothing {
+      process_side_effect_change(
+        analyzer,
+        reference_finder,
+        importing_file,
+        project_index,
+        state,
+      )?;
+    } else {
+      process_changed_file(
+        analyzer,
+        reference_finder,
+        importing_file,
+        project_index,
+        state,
+      )?;
+    }
   }
 
   process_changed_file(analyzer, reference_finder, file_path, project_index, state)
