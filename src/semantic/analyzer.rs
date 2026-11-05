@@ -330,7 +330,8 @@ impl WorkspaceAnalyzer {
   }
 
   /// Files that load `file_path` at runtime through a static import binding a
-  /// name from it, whatever the name (named, default or namespace import). Unlike
+  /// name from it, whatever the name (named, default or namespace import), or
+  /// through a re-export from it (`export { f } from`, `export * from`). Unlike
   /// the symbol-keyed `import_index`, this is what a change to the module's
   /// side effects reaches: the importer runs them whatever it uses.
   ///
@@ -370,6 +371,16 @@ impl WorkspaceAnalyzer {
           .entry(source_file.clone())
           .or_default()
           .push(importing_file.clone());
+      }
+    }
+    // A re-export (`export { f } from "./x"`, `export * from "./x"`) loads the
+    // module too, so the barrel runs the source's side effects.
+    for (source_file, reexports) in &self.reexport_index {
+      for (reexporting_file, _export) in reexports {
+        index
+          .entry(source_file.clone())
+          .or_default()
+          .push(reexporting_file.clone());
       }
     }
     for importing_files in index.values_mut() {
