@@ -1,0 +1,42 @@
+name: Fork Preview Cleanup
+
+# Upstream's cleanup-preview-release.yml only runs in upstream's repository, and only at
+# close, while a PR merged before its CI ends publishes its preview after that. So this also
+# runs after each published preview, and sweeps every preview whose PR is no longer open.
+'on':
+  pull_request:
+    types: [closed]
+  workflow_run:
+    workflows: ['Preview Release']
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: read
+
+# Two sweeps running at once would race to delete the same release, and the loser would fail.
+concurrency:
+  group: fork-preview-cleanup
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: Delete previews of closed PRs
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete every preview whose PR is not open
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          open_prs=$(gh pr list --state open --limit 1000 --json number --jq '.[].number')
+          previews=$(gh release list --limit 1000 --json tagName,isPrerelease --jq '.[] | select(.isPrerelease) | .tagName')
+          for tag in $previews; do
+            [[ "$tag" =~ ^pr-([0-9]+)-[0-9a-f]+$ ]] || continue
+            grep -qx "${BASH_REMATCH[1]}" <<< "$open_prs" && continue
+            echo "Deleting $tag"
+            gh release delete "$tag" --yes --cleanup-tag
+          done
