@@ -26,8 +26,13 @@ commits_. Everything here exists to keep that sentence true.
 the first against `git log --format=%s upstream-tag..HEAD`, so the manifest is the tripwire
 for a patch silently dropped during an automated rebase.
 
+`fork-manifest.yml` runs the same comparison on every PR, so a commit with no line at the top
+of `patches.txt` fails while the PR is open rather than at the next sync. `sync/*` branches are
+exempt: they land by force-push, and their commits against `main` are upstream's.
+
 | Patch | Upstream PR | State |
 | --- | --- | --- |
+| `ci(fork): fail a pull request whose commits are not in the manifest` | fork-only | — |
 | `chore(fork): stop the sync on conflicts in merge=union files` | fork-only | — |
 | `fix(resolve): resolve package.json "imports" subpath specifiers` | not submitted | worth sending; upstream's `is_workspace_specifier` still drops `#` specifiers |
 | `chore(fork): list the asset specifier patch in the manifest` | fork-only | — |
