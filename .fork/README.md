@@ -28,6 +28,7 @@ for a patch silently dropped during an automated rebase.
 
 | Patch | Upstream PR | State |
 | --- | --- | --- |
+| `chore(fork): stop the sync on conflicts in merge=union files` | fork-only | — |
 | `fix(resolve): resolve package.json "imports" subpath specifiers` | not submitted | worth sending; upstream's `is_workspace_specifier` still drops `#` specifiers |
 | `chore(fork): list the asset specifier patch in the manifest` | fork-only | — |
 | `fix(core): affect every project when lockfile analysis fails` | not submitted | worth sending; upstream still logs the failure at `debug` and carries on |
@@ -66,25 +67,31 @@ git fetch origin
 git push --force-with-lease origin origin/sync/v2.1.0:main
 ```
 
-By hand, the whole sync is:
-
-```bash
-git fetch upstream --tags
-git rebase v2.1.0
-```
+By hand, the whole sync is the sequence under
+[When it stops on a conflict](#when-it-stops-on-a-conflict). Do not skip its override: a
+plain `git rebase` does not stop on most conflicts.
 
 ### When it stops on a conflict
 
 The workflow stops at any conflict rather than guessing at a semantic merge, which is how a
-fork silently loses behavior. Conflicts are resolved by a person, locally:
+fork silently loses behavior. Upstream's `.gitattributes` sets `merge=union` on `*.ts`,
+`*.tsx`, `*.rs`, `*.js`, `*.json` and `*.debug`, which keeps both sides of a conflict in those
+files with no markers, so a plain rebase carries on: replaying the stack onto `v2.2.0` stopped
+once where it should have stopped six times. `info/attributes` outranks `.gitattributes`, so
+the workflow overrides it there rather than editing upstream's file, and a rebase on your
+machine needs the same override. Conflicts are resolved by a person, locally:
 
 ```bash
 git config rerere.enabled true      # once per clone
 git config rerere.autoupdate true
+printf '%s merge=text\n' '*.ts' '*.tsx' '*.rs' '*.js' '*.json' '*.debug' >> "$(git rev-parse --git-path info/attributes)"   # once per clone
 git fetch upstream --tags
 git rebase v2.1.0                   # resolve, git add, git rebase --continue
 git push --force-with-lease origin HEAD:main
 ```
+
+The override lives in the clone's git directory, so every worktree of the clone shares it and
+a fresh clone needs it again.
 
 `rerere` is worth enabling in your own clone: it records each resolution and replays it on
 your later rebases, so a conflict that recurs every sync is resolved once. It is
@@ -92,10 +99,12 @@ deliberately **not** wired into the workflow — rerere only replays resolutions
 the same `.git`, and a resolution made on your machine never reaches a runner, so caching
 `.git/rr-cache` in CI would only ever restore caches that never held a resolution.
 
-The two patches that conflict are the ones that edit upstream functions in place
-(`resolve_options.rs`, `workspace/mod.rs`). Restructuring them to be additive — a new module
-plus a one-line call site — would remove most of the conflict surface, and is the
-highest-value follow-up here.
+Conflicts come from the patches that edit upstream code in place. The `v2.2.0` sync conflicted in
+`CI.yml`, `semantic/analyzer.rs` and `semantic/mod.rs` (tsconfig paths),
+`tests/integration_test.rs` (tsconfig paths, `imports`), `core.rs` (asset specifiers) and
+`lockfile.rs` (both lockfile patches). Restructuring them to be additive — a new module plus a
+one-line call site — would remove most of the conflict surface, and is the highest-value
+follow-up here.
 
 ## Releases
 

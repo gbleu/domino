@@ -103,6 +103,15 @@ jobs:
           set -euo pipefail
           git checkout -B "sync/$TAG"
 
+          # Upstream's .gitattributes sets merge=union on these, which keeps both sides of
+          # a conflict with no markers, so the rebase would carry on and the result could
+          # still pass the fast checks below. info/attributes outranks .gitattributes and
+          # leaves upstream's file alone. Replaying the stack onto v2.2.0 stops six times
+          # with this and once without it.
+          attributes=$(git rev-parse --git-path info/attributes)
+          mkdir -p "$(dirname "$attributes")"
+          printf '%s merge=text\n' '*.ts' '*.tsx' '*.rs' '*.js' '*.json' '*.debug' > "$attributes"
+
           status=0
           git rebase "$REF" || status=$?
 
@@ -117,7 +126,7 @@ jobs:
             unresolved=$(git diff --name-only --diff-filter=U)
             if [ -n "$unresolved" ]; then
               echo "::error::Conflict while rebasing onto $TAG — resolve it locally and push"
-              echo "git fetch upstream --tags && git rebase $TAG   # then force-push to main"
+              echo "Follow 'When it stops on a conflict' in .fork/README.md: a plain rebase keeps both sides of merge=union conflicts without stopping"
               echo "$unresolved"
               exit 1
             fi
