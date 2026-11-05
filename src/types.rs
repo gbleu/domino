@@ -173,6 +173,19 @@ pub struct Import {
   pub is_dynamic: bool,
 }
 
+impl Import {
+  /// `imported_name` and `local_name` of a side-effect import (`import "./setup"`),
+  /// which binds nothing. The importing file depends on the whole of the imported
+  /// module, so it is indexed under this name rather than under a symbol. Not a
+  /// valid identifier, so it cannot collide with a real binding.
+  pub const SIDE_EFFECT: &'static str = "<side-effect>";
+
+  /// Whether this is a side-effect import (`import "./setup"`).
+  pub fn is_side_effect(&self) -> bool {
+    self.imported_name == Self::SIDE_EFFECT
+  }
+}
+
 /// Export information
 #[derive(Debug, Clone)]
 pub struct Export {
