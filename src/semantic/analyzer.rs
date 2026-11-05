@@ -3,7 +3,7 @@ use crate::profiler::Profiler;
 use crate::types::{Export, Import, Project, Reference};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-  ExportNamedDeclaration, Expression, ImportDeclaration, ImportDeclarationSpecifier,
+  ExportNamedDeclaration, Expression, ImportDeclaration, ImportDeclarationSpecifier, Statement,
 };
 use oxc_ast::AstKind;
 use oxc_ast_visit::walk;
@@ -16,7 +16,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tracing::{debug, warn};
 use walkdir::WalkDir;
@@ -168,6 +168,10 @@ pub struct WorkspaceAnalyzer {
   /// Without this index, every reference lookup had to scan the exports of every file
   /// in the workspace and resolve each re-export specifier.
   pub reexport_index: ReexportIndexMap,
+  /// Reverse runtime-import index: source_file -> files loading it through a static
+  /// import that binds names. Built from `import_index` on first use only, since
+  /// only side-effect changes need it (see [`WorkspaceAnalyzer::binding_importers_of`]).
+  binding_importers: OnceLock<FxHashMap<PathBuf, Vec<PathBuf>>>,
   /// Resolver shared by the import index, the re-export index and `ReferenceFinder`
   pub(crate) resolver: super::WorkspaceResolver,
   /// Profiler for performance measurement
@@ -194,6 +198,7 @@ impl WorkspaceAnalyzer {
       projects,
       import_index: FxHashMap::default(),
       reexport_index: FxHashMap::default(),
+      binding_importers: OnceLock::new(),
       resolver,
       profiler,
     };
@@ -328,6 +333,56 @@ impl WorkspaceAnalyzer {
     self.import_index = index;
 
     Ok(())
+  }
+
+  /// Files that load `file_path` at runtime through a static import binding a
+  /// name from it, whatever the name (named, default or namespace import). Unlike
+  /// the symbol-keyed `import_index`, this is what a change to the module's
+  /// side effects reaches: the importer runs them whatever it uses.
+  ///
+  /// Left out: side-effect imports (`import "./file"`, traced through their own
+  /// `import_index` entry), type-only imports (erased, they load nothing), and
+  /// dynamic `import()` (the lazy boundary isolates its importer from everything
+  /// but the default export, see `ReferenceFinder::find_refs_recursive`).
+  pub fn binding_importers_of(&self, file_path: &Path) -> &[PathBuf] {
+    self
+      .binding_importers
+      .get_or_init(|| self.build_binding_importers())
+      .get(file_path)
+      .map(Vec::as_slice)
+      .unwrap_or_default()
+  }
+
+  fn build_binding_importers(&self) -> FxHashMap<PathBuf, Vec<PathBuf>> {
+    let mut index: FxHashMap<PathBuf, Vec<PathBuf>> = FxHashMap::default();
+    for ((source_file, imported_name), importers) in &self.import_index {
+      if imported_name == Import::SIDE_EFFECT {
+        continue;
+      }
+      for (importing_file, local_name, from_module, is_dynamic) in importers {
+        let is_type_only = || {
+          self.imports.get(importing_file).is_some_and(|imports| {
+            imports.iter().any(|import| {
+              import.is_type_only
+                && &import.local_name == local_name
+                && &import.from_module == from_module
+            })
+          })
+        };
+        if *is_dynamic || is_type_only() {
+          continue;
+        }
+        index
+          .entry(source_file.clone())
+          .or_default()
+          .push(importing_file.clone());
+      }
+    }
+    for importing_files in index.values_mut() {
+      importing_files.sort();
+      importing_files.dedup();
+    }
+    index
   }
 
   /// Analyze all files in the workspace using parallel parsing
@@ -661,6 +716,20 @@ impl WorkspaceAnalyzer {
           }
         }
       }
+    }
+
+    // `import "./setup"` (or `import {} from "./setup"`) binds nothing: the module
+    // is loaded for its side effects. Record it so the importer can be traced as
+    // depending on the whole module. `import type {} from` erases at compile time.
+    if imports.is_empty() && !is_type_only {
+      imports.push(Import {
+        imported_name: Import::SIDE_EFFECT.to_string(),
+        local_name: Import::SIDE_EFFECT.to_string(),
+        from_module,
+        resolved_file: None,
+        is_type_only: false,
+        is_dynamic: false,
+      });
     }
 
     imports
@@ -1031,7 +1100,7 @@ impl WorkspaceAnalyzer {
 
   /// Resolve the enclosing top-level symbol(s) at `line`/`column` within an
   /// already-parsed file. Shared by [`WorkspaceAnalyzer::find_node_at_line`]
-  /// (working-tree files) and [`WorkspaceAnalyzer::find_deleted_symbols`]
+  /// (working-tree files) and [`WorkspaceAnalyzer::find_deleted_changes`]
   /// (base-revision snapshots of deleted code). Takes `&FileSemanticData`
   /// rather than `&self` so it can run against a one-off parse that never
   /// enters `self.files`.
@@ -1239,7 +1308,9 @@ impl WorkspaceAnalyzer {
     Ok(top_level_name.map(|name| vec![name]).unwrap_or_default())
   }
 
-  /// Recover the top-level symbols that enclosed a set of *base-revision* lines.
+  /// Recover what a set of deleted *base-revision* lines changed: the top-level
+  /// symbols that enclosed them, and whether any of them was top-level
+  /// side-effect code.
   ///
   /// When a change is a pure deletion (`@@ -X,Y +Z,0 @@`), the removed lines no
   /// longer exist in the working tree, so [`WorkspaceAnalyzer::find_node_at_line`]
@@ -1255,34 +1326,44 @@ impl WorkspaceAnalyzer {
   ///
   /// The returned names are then traced through the *current* import graph —
   /// consumers still `import { Foo }` from the file even after `Foo` is deleted,
-  /// so their projects are correctly reported affected. Returns de-duplicated
-  /// names, preserving first-seen order; an empty vec if the snapshot fails to
-  /// parse or no line resolves to a symbol.
-  pub fn find_deleted_symbols(
+  /// so their projects are correctly reported affected. Names are de-duplicated,
+  /// preserving first-seen order; empty if the snapshot fails to parse or no line
+  /// resolves to a symbol.
+  ///
+  /// A deleted line that resolves to no symbol but belonged to a top-level
+  /// side-effect statement (removing `import "./setup"`, say) sets
+  /// [`DeletedChanges::has_side_effect`], with the same rule as
+  /// [`WorkspaceAnalyzer::is_side_effect_line`].
+  pub fn find_deleted_changes(
     &self,
     file_path: &Path,
     base_source: &str,
     deleted_lines: &[usize],
-  ) -> Vec<String> {
+  ) -> DeletedChanges {
+    let mut changes = DeletedChanges::default();
     if deleted_lines.is_empty() {
-      return Vec::new();
+      return changes;
     }
 
     let file_data = match Self::parse_source(file_path, base_source.to_string()) {
       Ok(data) => data,
       Err(e) => {
         debug!("Failed to parse base revision of {:?}: {}", file_path, e);
-        return Vec::new();
+        return changes;
       }
     };
 
-    let mut symbols: Vec<String> = Vec::new();
     for &line in deleted_lines {
       match Self::find_top_level_symbols(&file_data, line, 0) {
+        Ok(names) if names.is_empty() => {
+          if !changes.has_side_effect && Self::is_top_level_side_effect_at_line(&file_data, line) {
+            changes.has_side_effect = true;
+          }
+        }
         Ok(names) => {
           for name in names {
-            if !symbols.contains(&name) {
-              symbols.push(name);
+            if !changes.symbols.contains(&name) {
+              changes.symbols.push(name);
             }
           }
         }
@@ -1292,8 +1373,84 @@ impl WorkspaceAnalyzer {
         ),
       }
     }
-    symbols
+    changes
   }
+
+  /// Whether `line` of an analyzed file belongs to top-level side-effect code:
+  /// a statement that runs when the module is loaded and is not part of any
+  /// symbol. Meant for lines [`WorkspaceAnalyzer::find_node_at_line`] resolves to
+  /// no symbol, which are otherwise untraceable.
+  ///
+  /// Side-effect statements are side-effect imports (`import "./setup"`),
+  /// expression statements (`globalThis.featureFlag = computeValue()`), control
+  /// flow and blocks, and non-ambient variable and class declarations. Comments
+  /// and blank lines belong to no statement. Imports that bind names, re-exports
+  /// (`export * from`) and type-level declarations are not side-effect code: what
+  /// they change is traced through the symbols that use or re-export them.
+  pub fn is_side_effect_line(&self, file_path: &Path, line: usize) -> bool {
+    self
+      .files
+      .get(file_path)
+      .is_some_and(|file_data| Self::is_top_level_side_effect_at_line(file_data, line))
+  }
+
+  fn is_top_level_side_effect_at_line(file_data: &FileSemanticData, line: usize) -> bool {
+    let source = file_data.source();
+    let Some(line_start) = crate::utils::line_to_offset(source, line) else {
+      return false;
+    };
+    let line_end = crate::utils::line_to_offset(source, line + 1).unwrap_or(source.len());
+
+    file_data
+      .semantic()
+      .nodes()
+      .program()
+      .body
+      .iter()
+      .any(|statement| {
+        let span = statement.span();
+        (span.start as usize) < line_end
+          && (span.end as usize) > line_start
+          && Self::is_side_effect_statement(statement)
+      })
+  }
+
+  fn is_side_effect_statement(statement: &Statement) -> bool {
+    match statement {
+      Statement::ImportDeclaration(import_decl) => {
+        import_decl.import_kind.is_value()
+          && import_decl
+            .specifiers
+            .as_ref()
+            .is_none_or(|specifiers| specifiers.is_empty())
+      }
+      Statement::VariableDeclaration(var_decl) => !var_decl.declare,
+      Statement::ClassDeclaration(class_decl) => !class_decl.declare,
+      Statement::ExpressionStatement(_)
+      | Statement::BlockStatement(_)
+      | Statement::IfStatement(_)
+      | Statement::SwitchStatement(_)
+      | Statement::TryStatement(_)
+      | Statement::ThrowStatement(_)
+      | Statement::LabeledStatement(_)
+      | Statement::ForStatement(_)
+      | Statement::ForInStatement(_)
+      | Statement::ForOfStatement(_)
+      | Statement::WhileStatement(_)
+      | Statement::DoWhileStatement(_) => true,
+      _ => false,
+    }
+  }
+}
+
+/// What the pure-deletion hunks of a changed file removed, recovered from its base
+/// revision by [`WorkspaceAnalyzer::find_deleted_changes`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DeletedChanges {
+  /// Top-level symbols that enclosed a deleted line, de-duplicated in first-seen order
+  pub symbols: Vec<String>,
+  /// Whether a deleted line belonged to top-level side-effect code
+  pub has_side_effect: bool,
 }
 
 #[cfg(test)]
@@ -1551,7 +1708,7 @@ const [x, y] = [1, 2]"#;
   }
 
   #[test]
-  fn test_find_deleted_symbols_whole_exported_declaration() {
+  fn test_find_deleted_changes_whole_exported_declaration() {
     // The base revision no longer needs to be in `analyzer.files`: deletion
     // recovery parses the passed-in snapshot directly. Deleting the entire
     // `Removed` const (base lines 1-3) must resolve to "Removed".
@@ -1565,12 +1722,13 @@ export const Kept = 2;
     let analyzer =
       WorkspaceAnalyzer::new(vec![], Path::new("."), profiler).expect("Failed to create analyzer");
 
-    let symbols = analyzer.find_deleted_symbols(Path::new("gone.ts"), base_source, &[1, 2, 3]);
-    assert_eq!(symbols, vec!["Removed".to_string()]);
+    let changes = analyzer.find_deleted_changes(Path::new("gone.ts"), base_source, &[1, 2, 3]);
+    assert_eq!(changes.symbols, vec!["Removed".to_string()]);
+    assert!(!changes.has_side_effect);
   }
 
   #[test]
-  fn test_find_deleted_symbols_member_resolves_enclosing_symbol() {
+  fn test_find_deleted_changes_member_resolves_enclosing_symbol() {
     // Deleting a member line (base line 3, `beta: 2,`) resolves to the enclosing
     // top-level symbol `TABLE`, not the member itself — de-duplicated across the
     // deleted lines.
@@ -1584,17 +1742,97 @@ export const Kept = 2;
     let analyzer =
       WorkspaceAnalyzer::new(vec![], Path::new("."), profiler).expect("Failed to create analyzer");
 
-    let symbols = analyzer.find_deleted_symbols(Path::new("table.ts"), base_source, &[3]);
-    assert_eq!(symbols, vec!["TABLE".to_string()]);
+    let changes = analyzer.find_deleted_changes(Path::new("table.ts"), base_source, &[3]);
+    assert_eq!(changes.symbols, vec!["TABLE".to_string()]);
+    assert!(!changes.has_side_effect);
   }
 
   #[test]
-  fn test_find_deleted_symbols_empty_lines_returns_empty() {
+  fn test_extract_side_effect_imports() {
+    let source = r#"import "./setup";
+import {} from "./empty-braces";
+import type {} from "./types-only";
+import { named } from "./named";
+"#;
+    let file_path = Path::new("index.ts");
+    let allocator = Allocator::default();
+    let parse_result = Parser::new(&allocator, source, SourceType::ts()).parse();
+
+    let imports = WorkspaceAnalyzer::extract_imports(&parse_result.program, file_path);
+
+    let side_effect_modules: Vec<_> = imports
+      .iter()
+      .filter(|imp| imp.is_side_effect())
+      .map(|imp| imp.from_module.as_str())
+      .collect();
+    assert_eq!(
+      side_effect_modules,
+      vec!["./setup", "./empty-braces"],
+      "a value import binding nothing is a side-effect import; a type-only one erases"
+    );
+    assert!(imports
+      .iter()
+      .any(|imp| imp.from_module == "./named" && imp.imported_name == "named"));
+  }
+
+  #[test]
+  fn test_side_effect_lines_are_top_level_runtime_code() {
+    let source = r#"// header comment
+import "./setup";
+import { computeValue } from "./helper";
+export * from "./barrel";
+type Shape = { id: string };
+declare const ambient: number;
+
+console.log(computeValue());
+if (process.env.DEBUG) {
+  console.debug(computeValue());
+}
+export const Widget = 1;
+"#;
+    let file_data =
+      WorkspaceAnalyzer::parse_source(Path::new("setup.ts"), source.to_string()).unwrap();
+    let side_effect_lines: Vec<usize> = (1..=13)
+      .filter(|&line| WorkspaceAnalyzer::is_top_level_side_effect_at_line(&file_data, line))
+      .collect();
+
+    assert_eq!(
+      side_effect_lines,
+      vec![2, 8, 9, 10, 11],
+      "side-effect import, expression statement and control flow are side-effect code; \
+       comments, binding imports, re-exports, types, ambient and exported declarations \
+       are not"
+    );
+  }
+
+  #[test]
+  fn test_find_deleted_changes_side_effect_import() {
+    let base_source = r#"import "./polyfills/removed";
+import "./polyfills/kept";
+export const Kept = 2;
+"#;
     let profiler = Arc::new(Profiler::new(false));
     let analyzer =
       WorkspaceAnalyzer::new(vec![], Path::new("."), profiler).expect("Failed to create analyzer");
-    let symbols = analyzer.find_deleted_symbols(Path::new("x.ts"), "export const A = 1;\n", &[]);
-    assert!(symbols.is_empty());
+
+    let changes = analyzer.find_deleted_changes(Path::new("index.ts"), base_source, &[1]);
+    assert_eq!(
+      changes,
+      DeletedChanges {
+        symbols: vec![],
+        has_side_effect: true,
+      },
+      "removing a side-effect import is a side-effect change, not a symbol change"
+    );
+  }
+
+  #[test]
+  fn test_find_deleted_changes_empty_lines_returns_empty() {
+    let profiler = Arc::new(Profiler::new(false));
+    let analyzer =
+      WorkspaceAnalyzer::new(vec![], Path::new("."), profiler).expect("Failed to create analyzer");
+    let changes = analyzer.find_deleted_changes(Path::new("x.ts"), "export const A = 1;\n", &[]);
+    assert_eq!(changes, DeletedChanges::default());
   }
 
   #[test]
@@ -2544,5 +2782,73 @@ export function run() {
       !analyzer.import_index.contains_key(&const_a_key),
       "CONST_A is never imported and must not appear in the import index"
     );
+  }
+
+  #[test]
+  fn test_binding_importers_of_keeps_runtime_binding_imports_only() {
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().expect("Failed to create temp dir");
+    let cwd = tmp
+      .path()
+      .canonicalize()
+      .expect("Failed to canonicalize temp dir");
+    let src = cwd.join("app/src");
+    fs::create_dir_all(&src).unwrap();
+
+    let files = [
+      (
+        "helper.ts",
+        "export const computeValue = 1;\nexport type Shape = { id: string };\n",
+      ),
+      (
+        "named.ts",
+        "import { computeValue } from './helper';\nexport const a = computeValue;\n",
+      ),
+      (
+        "default.ts",
+        "import helper from './helper';\nexport const b = helper;\n",
+      ),
+      ("namespace.ts", "import * as m from './helper';\nvoid m;\n"),
+      (
+        "mixed.ts",
+        "import { type Shape, computeValue } from './helper';\nexport const c: Shape | number = computeValue;\n",
+      ),
+      (
+        "types.ts",
+        "import type { Shape } from './helper';\nexport type S = Shape;\n",
+      ),
+      ("bare.ts", "import './helper';\n"),
+      ("lazy.ts", "export const load = () => import('./helper');\n"),
+    ];
+    for (name, content) in files {
+      fs::write(src.join(name), content).unwrap();
+    }
+
+    let projects = vec![Project {
+      name: "app".to_string(),
+      root: PathBuf::from("app"),
+      source_root: PathBuf::from("app/src"),
+      ts_config: None,
+      implicit_dependencies: vec![],
+      config_dependencies: vec![],
+      targets: vec![],
+    }];
+    let profiler = Arc::new(Profiler::new(false));
+    let analyzer =
+      WorkspaceAnalyzer::new(projects, &cwd, profiler).expect("Failed to create analyzer");
+
+    assert_eq!(
+      analyzer.binding_importers_of(Path::new("app/src/helper.ts")),
+      ["default.ts", "mixed.ts", "named.ts", "namespace.ts"]
+        .map(|name| PathBuf::from("app/src").join(name))
+        .as_slice(),
+      "named, default and namespace imports load the module; type-only imports are \
+       erased, side-effect imports have their own index entry, and dynamic imports keep \
+       their lazy boundary"
+    );
+    assert!(analyzer
+      .binding_importers_of(Path::new("app/src/named.ts"))
+      .is_empty());
   }
 }

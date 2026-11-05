@@ -7505,6 +7505,50 @@ fn test_root_tsconfig_aliases_empty_re_export_traces_every_export() {
   );
 }
 
+/// A side-effect import of a changed alias now loads another module, which
+/// changes what loading the importing file does: its side-effect importers and
+/// its namespace importers are reached, not only the importers of its exports.
+#[test]
+fn test_root_tsconfig_aliases_side_effect_import_is_a_side_effect_change() {
+  let repo = TempNxRepo::new(r#"{}"#);
+  let project = |name: &str| format!(r#"{{ "name": "{name}", "sourceRoot": "libs/{name}/src" }}"#);
+  let tsconfig = |a_target: &str| {
+    format!(
+      r#"{{ "compilerOptions": {{ "baseUrl": ".", "paths": {{ "@acme/a": ["{a_target}"], "@acme/x": ["libs/lib-x/src/index.ts"] }} }} }}"#
+    )
+  };
+  let base = tsconfig(A_INDEX);
+  let (x_project, y_project, z_project) = (project("lib-x"), project("lib-y"), project("lib-z"));
+  commit_files_on_main(
+    &repo,
+    &[
+      ("tsconfig.base.json", base.as_str()),
+      (A_OTHER, "export const a = 2;\n"),
+      ("libs/lib-x/project.json", x_project.as_str()),
+      (
+        "libs/lib-x/src/index.ts",
+        "import '@acme/a';\n\nexport const other = 1;\n",
+      ),
+      ("libs/lib-y/project.json", y_project.as_str()),
+      (
+        "libs/lib-y/src/index.ts",
+        "import '@acme/x';\n\nexport const y = 1;\n",
+      ),
+      ("libs/lib-z/project.json", z_project.as_str()),
+      (
+        "libs/lib-z/src/index.ts",
+        "import * as x from '@acme/x';\n\nvoid x;\n\nexport const z = 1;\n",
+      ),
+    ],
+  );
+  repo.change_and_commit("tsconfig.base.json", &tsconfig(A_OTHER));
+
+  assert_eq!(
+    affected_with_root_tsconfig_strategy(&repo, RootTsconfigStrategy::Aliases),
+    names(&["lib-x", "lib-y", "lib-z"])
+  );
+}
+
 /// A namedInput that lists the root tsconfig is the user's own declaration and
 /// invalidates globally whatever the strategy.
 #[test]
@@ -8156,5 +8200,394 @@ fn test_package_imports_symbol_change_reaches_importing_spec() {
     !via_files.iter().any(|(project, _)| project == "web"),
     "a package without `imports` does not resolve `#` specifiers. Got: {:?}",
     via_files
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Side-effect imports and top-level side-effect changes
+// ---------------------------------------------------------------------------
+
+/// Root of the single project of the side-effect scenarios.
+const SIDE_EFFECT_APP: &str = "apps/my-app";
+
+/// Commit `base` files (relative to [`SIDE_EFFECT_APP`]) to `main`, apply `head`
+/// (`None` deletes the file) on a `feature` branch, and return every `via_file`
+/// reported as importing something changed, relative to the project root, sorted.
+fn side_effect_via_files(base: &[(&str, &str)], head: &[(&str, Option<&str>)]) -> Vec<PathBuf> {
+  let in_app = |file: &str| format!("{SIDE_EFFECT_APP}/{file}");
+  let base_files: Vec<(String, &str)> = base
+    .iter()
+    .map(|(file, content)| (in_app(file), *content))
+    .collect();
+  let base_refs: Vec<(&str, &str)> = base_files
+    .iter()
+    .map(|(file, content)| (file.as_str(), *content))
+    .collect();
+  let (_tmp, root) = scaffold_repo(&base_refs);
+
+  for (file, content) in head {
+    let path = root.join(in_app(file));
+    match content {
+      Some(content) => {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+      }
+      None => fs::remove_file(path).unwrap(),
+    }
+  }
+  git_in(&root, &["add", "-A"]);
+  git_in(&root, &["commit", "-m", "change"]);
+
+  let config = TrueAffectedConfig {
+    cwd: root.to_path_buf(),
+    base: "main".to_string(),
+    head: None,
+    projects: vec![barrel_project("my-app", SIDE_EFFECT_APP)],
+    lockfile_strategy: LockfileStrategy::None,
+    root_tsconfig_strategy: Default::default(),
+  };
+  let profiler = Arc::new(Profiler::new(false));
+  let report = find_affected_with_report(config, profiler)
+    .expect("find_affected_with_report failed")
+    .report
+    .expect("expected a report");
+
+  let mut via_files: Vec<PathBuf> = report
+    .projects
+    .iter()
+    .flat_map(|project| project.causes.iter())
+    .filter_map(|cause| match cause {
+      AffectCause::ImportedSymbol { via_file, .. } => via_file
+        .strip_prefix(SIDE_EFFECT_APP)
+        .ok()
+        .map(Path::to_path_buf),
+      _ => None,
+    })
+    .collect();
+  via_files.sort();
+  via_files.dedup();
+  via_files
+}
+
+fn paths(files: &[&str]) -> Vec<PathBuf> {
+  files.iter().map(PathBuf::from).collect()
+}
+
+/// A module with two exported symbols, an exported type, and top-level code
+/// outside every symbol.
+const WIDGET: &str = r#"const widgets: string[] = [];
+
+export type WidgetShape = { name: string };
+
+export const widgetOptions = ["name"];
+
+export function unrelatedHelper() {
+  return 0;
+}
+
+widgets.push("widget");
+"#;
+
+fn widget_symbol_change() -> String {
+  WIDGET.replace(r#"["name"]"#, r#"["name", "size"]"#)
+}
+
+fn widget_side_effect_change() -> String {
+  WIDGET.replace(r#"widgets.push("widget");"#, r#"widgets.push("gadget");"#)
+}
+
+/// `setup.ts` loads the widget for its side effects, and the spec reaches the
+/// widget only through a named import of `setup.ts`.
+const SETUP: &str = "import \"./lib/widget\";\n\nexport function setup() {\n  return true;\n}\n";
+const SETUP_SPEC: &str = "import { setup } from \"./setup\";\n\nsetup();\n";
+
+#[test]
+fn test_side_effect_import_propagates_symbol_change() {
+  let via_files = side_effect_via_files(
+    &[
+      ("lib/widget.ts", WIDGET),
+      ("setup.ts", SETUP),
+      ("setup.spec.ts", SETUP_SPEC),
+    ],
+    &[("lib/widget.ts", Some(&widget_symbol_change()))],
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&["setup.spec.ts", "setup.ts"]),
+    "a side-effect importer of a module with a changed symbol is changed as a whole, \
+     so the importers of its exports are affected"
+  );
+}
+
+#[test]
+fn test_side_effect_import_propagates_side_effect_change() {
+  let via_files = side_effect_via_files(
+    &[
+      ("lib/widget.ts", WIDGET),
+      ("setup.ts", SETUP),
+      ("setup.spec.ts", SETUP_SPEC),
+    ],
+    &[("lib/widget.ts", Some(&widget_side_effect_change()))],
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&["setup.spec.ts", "setup.ts"]),
+    "a change to top-level code outside every symbol reaches the side-effect importer"
+  );
+}
+
+/// A side-effect change makes every static importer that loads the module changed
+/// as a whole, so a spec importing an export unrelated to the widget is reached.
+/// A type-only importer loads nothing, so it is not changed as a whole.
+#[test]
+fn test_side_effect_change_reaches_named_and_namespace_importers() {
+  let via_files = side_effect_via_files(
+    &[
+      ("lib/widget.ts", WIDGET),
+      (
+        "named.ts",
+        "import { unrelatedHelper } from \"./lib/widget\";\n\nexport function readHelper() {\n  return unrelatedHelper();\n}\n\nexport const namedLabel = \"named\";\n",
+      ),
+      (
+        "named.spec.ts",
+        "import { namedLabel } from \"./named\";\n\nnamedLabel.trim();\n",
+      ),
+      (
+        "namespace.ts",
+        "import * as widget from \"./lib/widget\";\n\nexport function countOptions() {\n  return widget.widgetOptions.length;\n}\n\nexport const namespaceLabel = \"namespace\";\n",
+      ),
+      (
+        "namespace.spec.ts",
+        "import { namespaceLabel } from \"./namespace\";\n\nnamespaceLabel.trim();\n",
+      ),
+      (
+        "typed.ts",
+        "import type { WidgetShape } from \"./lib/widget\";\n\nexport function describe(shape: WidgetShape) {\n  return shape.name;\n}\n\nexport const typedLabel = \"typed\";\n",
+      ),
+      (
+        "typed.spec.ts",
+        "import { typedLabel } from \"./typed\";\n\ntypedLabel.trim();\n",
+      ),
+      (
+        "lazy.ts",
+        "export const loadWidget = () => import(\"./lib/widget\");\n",
+      ),
+    ],
+    &[("lib/widget.ts", Some(&widget_side_effect_change()))],
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&[
+      "named.spec.ts",
+      "named.ts",
+      "namespace.spec.ts",
+      "namespace.ts",
+    ]),
+    "every static importer of a module whose side effects changed is changed as a whole, \
+     whatever it imports; a type-only importer loads nothing and is not, and a dynamic \
+     `import()` keeps its lazy boundary"
+  );
+}
+
+#[test]
+fn test_side_effect_imports_chain() {
+  let via_files = side_effect_via_files(
+    &[
+      ("lib/widget.ts", WIDGET),
+      ("lib/index.ts", "import \"./widget\";\n"),
+      (
+        "main.ts",
+        "import \"./lib/index\";\n\nexport function main() {\n  return true;\n}\n",
+      ),
+      (
+        "main.spec.ts",
+        "import { main } from \"./main\";\n\nmain();\n",
+      ),
+    ],
+    &[("lib/widget.ts", Some(&widget_symbol_change()))],
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&["lib/index.ts", "main.spec.ts", "main.ts"]),
+    "a change propagates along a chain of side-effect imports"
+  );
+}
+
+/// The polyfills pattern: an export-less `polyfills/index.ts` only loads each
+/// polyfill for its side effects, `setup.ts` reaches the index through a
+/// namespace import used in top-level code only, and `main.ts` loads `setup.ts`
+/// for its side effects. A symbol change in a polyfill must reach the spec
+/// through that whole chain, although the index has no export to trace and the
+/// namespace import reads no member.
+#[test]
+fn test_side_effect_import_into_export_less_polyfills_index_reaches_namespace_importer() {
+  let via_files = side_effect_via_files(
+    &[
+      ("polyfills/widget.ts", WIDGET),
+      ("polyfills/index.ts", "import \"./widget\";\n"),
+      (
+        "setup.ts",
+        "import * as polyfills from \"./polyfills/index\";\n\nvoid polyfills;\n\nexport function setup() {\n  return true;\n}\n",
+      ),
+      (
+        "main.ts",
+        "import \"./setup\";\n\nexport function main() {\n  return true;\n}\n",
+      ),
+      (
+        "main.spec.ts",
+        "import { main } from \"./main\";\n\nmain();\n",
+      ),
+      ("unrelated.spec.ts", "export const unrelated = true;\n"),
+    ],
+    &[("polyfills/widget.ts", Some(&widget_symbol_change()))],
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&["main.spec.ts", "main.ts", "polyfills/index.ts", "setup.ts",]),
+    "a side-effect importer of a changed module has a side-effect change of its own, \
+     which reaches its namespace importer even when it exports nothing"
+  );
+}
+
+/// A changed symbol used by top-level code of an importing file (outside every
+/// symbol) changes what loading that file does: its importers are affected
+/// whatever they import.
+#[test]
+fn test_changed_symbol_used_in_top_level_code_is_a_side_effect_change() {
+  let via_files = side_effect_via_files(
+    &[
+      ("lib/widget.ts", WIDGET),
+      (
+        "entry.ts",
+        "import { widgetOptions } from \"./lib/widget\";\n\nconst widgets = new Map<string, string[]>();\nwidgets.set(\"widget\", widgetOptions);\n\nexport const enabled = true;\n",
+      ),
+      (
+        "entry.spec.ts",
+        "import { enabled } from \"./entry\";\n\nconsole.log(enabled);\n",
+      ),
+    ],
+    &[("lib/widget.ts", Some(&widget_symbol_change()))],
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&["entry.spec.ts", "entry.ts"]),
+    "the importer of an unchanged export of a file whose top-level code uses the changed \
+     symbol is affected"
+  );
+}
+
+/// A script exports nothing: a spec loads it with a dynamic `import()` for its
+/// side effects, which is the dynamic counterpart of `import "./loader"`.
+#[test]
+fn test_dynamic_import_of_export_less_script_propagates_change() {
+  let via_files = side_effect_via_files(
+    &[
+      ("lib/widget.ts", WIDGET),
+      (
+        "setup.ts",
+        "import \"./lib/widget\";\n\nexport function setup() {\n  return true;\n}\n",
+      ),
+      (
+        "loader.ts",
+        "import * as setup from \"./setup\";\n\nvoid setup;\n",
+      ),
+      (
+        "loader.spec.ts",
+        "export async function run() {\n  await import(\"./loader\");\n}\n",
+      ),
+      (
+        "lazy.spec.ts",
+        "export const load = () => import(\"./setup\");\n",
+      ),
+    ],
+    &[("lib/widget.ts", Some(&widget_symbol_change()))],
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&["loader.spec.ts", "loader.ts", "setup.ts"]),
+    "a dynamic import of a script exporting nothing is for its side effects; a dynamic \
+     import of a module with exports keeps its lazy boundary"
+  );
+}
+
+/// `polyfills/index.ts` drops the side-effect import of a deleted polyfill. The
+/// index is reached only through a namespace import that reads no member, and
+/// that file only through a side-effect import.
+#[test]
+fn test_removed_side_effect_import_of_deleted_file_reaches_dependents() {
+  let via_files = side_effect_via_files(
+    &[
+      ("polyfills/widget.ts", WIDGET),
+      (
+        "polyfills/legacy.ts",
+        "export const legacyOptions = [\"id\"];\n",
+      ),
+      (
+        "polyfills/index.ts",
+        "import \"./widget\";\nimport \"./legacy\";\n",
+      ),
+      (
+        "setup.ts",
+        "import * as polyfills from \"./polyfills/index\";\n\nexport const loaded = polyfills;\n",
+      ),
+      (
+        "main.ts",
+        "import \"./setup\";\n\nexport function main() {\n  return true;\n}\n",
+      ),
+      (
+        "main.spec.ts",
+        "import { main } from \"./main\";\n\nmain();\n",
+      ),
+      (
+        "unrelated.spec.ts",
+        "import { widgetOptions } from \"./polyfills/widget\";\n\nwidgetOptions.slice();\n",
+      ),
+    ],
+    &[
+      ("polyfills/legacy.ts", None),
+      ("polyfills/index.ts", Some("import \"./widget\";\n")),
+    ],
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&["main.spec.ts", "main.ts", "setup.ts"]),
+    "removing a side-effect import is a side-effect change of the polyfills index, which \
+     reaches its namespace importer and, through side-effect imports, the spec"
+  );
+}
+
+#[test]
+fn test_unrelated_symbol_change_keeps_named_import_precision() {
+  let via_files = side_effect_via_files(
+    &[
+      ("lib/widget.ts", WIDGET),
+      (
+        "consumer.ts",
+        "import { widgetOptions } from \"./lib/widget\";\n\nexport const optionCount = widgetOptions.length;\n",
+      ),
+      (
+        "helper.ts",
+        "import { unrelatedHelper } from \"./lib/widget\";\n\nexport const helped = unrelatedHelper();\n",
+      ),
+      (
+        "namespace.ts",
+        "import * as widget from \"./lib/widget\";\n\nexport const options = widget.widgetOptions;\n",
+      ),
+    ],
+    &[("lib/widget.ts", Some(&WIDGET.replace("return 0;", "return 1;")))],
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&["helper.ts"]),
+    "without a side-effect change, only importers of the changed symbol are affected"
   );
 }
