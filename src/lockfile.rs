@@ -420,6 +420,11 @@ fn package_name_from_key(key: &str) -> &str {
 
 fn parse_pnpm_lockfile(content: &str) -> Result<LockfileData> {
   let parsed = parse_pnpm_documents(content)?;
+  if !parsed.is_mapping() {
+    return Err(DominoError::Parse(
+      "pnpm lockfile: not a YAML mapping".to_string(),
+    ));
+  }
 
   let mut direct_dependencies = FxHashSet::default();
   let mut packages = FxHashMap::default();
@@ -1804,6 +1809,43 @@ packages:
       .dependencies
       .contains_key("@svgr/core"));
     assert!(data.packages.contains_key("pnpm@10.0.0"));
+  }
+
+  #[test]
+  fn test_parse_pnpm_lockfile_without_a_mapping_is_an_error() {
+    assert!(parse_pnpm_lockfile("").is_err());
+    assert!(parse_pnpm_lockfile("not a lockfile").is_err());
+  }
+
+  #[test]
+  fn test_parse_pnpm_lockfile_reads_workspace_dependencies_from_two_documents() {
+    let content = r#"---
+lockfileVersion: '9.0'
+importers:
+  .:
+    packageManagerDependencies:
+      pnpm:
+        specifier: 12.10.1
+        version: 12.10.1
+packages:
+  pnpm@12.10.1: {}
+---
+lockfileVersion: '9.0'
+importers:
+  packages/a:
+    dependencies:
+      left-pad:
+        specifier: ^1.0.0
+        version: 1.0.0
+packages:
+  left-pad@1.0.0: {}
+"#;
+
+    let data = parse_pnpm_lockfile(content).unwrap();
+
+    assert!(data.direct_dependencies.contains("left-pad"));
+    assert!(!data.direct_dependencies.contains("pnpm"));
+    assert!(data.packages.contains_key("left-pad@1.0.0"));
   }
 
   // --- yarn parsing ---

@@ -28,6 +28,7 @@ for a patch silently dropped during an automated rebase.
 
 | Patch | Upstream PR | State |
 | --- | --- | --- |
+| `fix(lockfile): reject a pnpm lockfile that is not a mapping` | not submitted | worth sending; upstream's parser still reads such a file as an empty package list |
 | `chore(fork): automate releases and the upstream rebase` | fork-only | — |
 | `fix(semantic): resolve project tsconfig paths aliases` | `upstream#95` | open; absent from upstream `main` |
 | `fix(semantic): cascade the default export through dynamic imports` | not submitted | prior art: `upstream#12`, `upstream#69` |
