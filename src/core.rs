@@ -4,11 +4,11 @@ use crate::lockfile;
 use crate::named_inputs;
 use crate::path_aliases;
 use crate::profiler::Profiler;
-use crate::semantic::analyzer::FileSemanticData;
+use crate::semantic::analyzer::{DeletedChanges, FileSemanticData};
 use crate::semantic::{AssetReferenceFinder, PackageIndex, ReferenceFinder, WorkspaceAnalyzer};
 use crate::types::{
   AffectCause, AffectedProjectInfo, AffectedReport, AffectedResult, ChangedFile, GlobalTrigger,
-  LockfileStrategy, Project, ReportTotals, RootTsconfigStrategy, TrueAffectedConfig,
+  Import, LockfileStrategy, Project, ReportTotals, RootTsconfigStrategy, TrueAffectedConfig,
 };
 use crate::utils::{self, ProjectIndex};
 use oxc_ast::AstKind;
@@ -288,23 +288,33 @@ fn find_affected_internal(
     // what lets dependents of a deleted symbol — an object property, a `switch`
     // case, or a whole exported declaration — be traced. Consumers still import
     // the symbol in the current graph, so the traversal below reaches them.
-    let deleted_symbols: Vec<String> = if changed_file.deleted_lines.is_empty() {
-      Vec::new()
+    let deleted_changes = if changed_file.deleted_lines.is_empty() {
+      DeletedChanges::default()
     } else {
       match git::get_file_at_revision(&config.cwd, &merge_base, file_path) {
         Ok(Some(base_source)) => {
-          analyzer.find_deleted_symbols(file_path, &base_source, &changed_file.deleted_lines)
+          analyzer.find_deleted_changes(file_path, &base_source, &changed_file.deleted_lines)
         }
-        Ok(None) => Vec::new(),
+        Ok(None) => DeletedChanges::default(),
         Err(e) => {
           debug!(
             "Failed to read base revision of {:?} for deleted-symbol recovery: {}",
             file_path, e
           );
-          Vec::new()
+          DeletedChanges::default()
         }
       }
     };
+    let deleted_symbols = &deleted_changes.symbols;
+
+    // A changed or deleted line outside every symbol that belongs to top-level
+    // side-effect code (`import "./setup"`, `console.log(helper())`) changes
+    // what loading the module does, which no symbol trace carries. See
+    // `process_side_effect_change`.
+    let has_side_effect_change = deleted_changes.has_side_effect
+      || symbols_by_line.iter().any(|(line, symbols)| {
+        symbols.is_empty() && analyzer.is_side_effect_line(file_path, *line)
+      });
     if !deleted_symbols.is_empty() {
       debug!(
         "Recovered {} deleted symbol(s) from base revision of {:?}: {:?}",
@@ -350,13 +360,24 @@ fn find_affected_internal(
 
         // Deleted symbols have no surviving new-side line; record them at line 0
         // so the report still explains why the owning package is affected.
-        for symbol in &deleted_symbols {
+        for symbol in deleted_symbols {
           project_causes
             .entry(pkg.clone())
             .or_default()
             .push(AffectCause::DirectChange {
               file: file_path.clone(),
               symbol: Some(symbol.clone()),
+              line: 0,
+            });
+        }
+        // Likewise for deleted side-effect code, which has no symbol to name.
+        if deleted_changes.has_side_effect {
+          project_causes
+            .entry(pkg.clone())
+            .or_default()
+            .push(AffectCause::DirectChange {
+              file: file_path.clone(),
+              symbol: None,
               line: 0,
             });
         }
@@ -373,51 +394,75 @@ fn find_affected_internal(
       .collect();
     unique_symbols.extend(deleted_symbols.iter());
 
-    if unique_symbols.is_empty() {
-      debug!(
-        "No traceable symbols found in {:?}, skipping reference traversal",
-        file_path
-      );
-    } else {
-      debug!(
-        "Found {} unique symbols from {} changed and {} deleted lines in {:?}",
-        unique_symbols.len(),
-        changed_file.changed_lines.len(),
-        changed_file.deleted_lines.len(),
-        file_path
-      );
+    debug!(
+      "Found {} unique symbols from {} changed and {} deleted lines in {:?} (side-effect change: {})",
+      unique_symbols.len(),
+      changed_file.changed_lines.len(),
+      changed_file.deleted_lines.len(),
+      file_path,
+      has_side_effect_change
+    );
 
-      // Trace each unique symbol exactly once with a shared visited set.
-      // NOTE: sharing the visited set across symbols is correct for affected_packages
-      // (set insert is idempotent) but means project_causes may not record every
-      // independent cause path — a project affected via two different symbols will
-      // only have the cause from whichever symbol was traced first.
-      let mut visited = FxHashSet::default();
-      let mut state = AffectedState {
-        affected_packages: &mut affected_packages,
-        project_causes: if generate_report {
-          Some(&mut project_causes)
-        } else {
-          None
-        },
-        visited: &mut visited,
-      };
+    // Trace each unique symbol exactly once with a shared visited set.
+    // NOTE: sharing the visited set across symbols is correct for affected_packages
+    // (set insert is idempotent) but means project_causes may not record every
+    // independent cause path — a project affected via two different symbols will
+    // only have the cause from whichever symbol was traced first.
+    let mut visited = FxHashSet::default();
+    let mut state = AffectedState {
+      affected_packages: &mut affected_packages,
+      project_causes: if generate_report {
+        Some(&mut project_causes)
+      } else {
+        None
+      },
+      visited: &mut visited,
+    };
 
-      for symbol_name in &unique_symbols {
-        debug!("Processing symbol '{}' in {:?}", symbol_name, file_path);
-        if let Err(e) = process_changed_symbol(
-          &analyzer,
-          &reference_finder,
-          file_path,
-          symbol_name,
-          &project_index,
-          &mut state,
-        ) {
-          debug!(
-            "Error processing symbol '{}' in {:?}: {}",
-            symbol_name, file_path, e
-          );
-        }
+    // Any change to the file, even one resolving to no symbol, reaches the files
+    // importing it for its side effects (`import "./file"`).
+    if let Err(e) = propagate_to_side_effect_importers(
+      &analyzer,
+      &reference_finder,
+      file_path,
+      &project_index,
+      &mut state,
+    ) {
+      debug!(
+        "Error propagating {:?} to its side-effect importers: {}",
+        file_path, e
+      );
+    }
+
+    if has_side_effect_change {
+      if let Err(e) = process_side_effect_change(
+        &analyzer,
+        &reference_finder,
+        file_path,
+        &project_index,
+        &mut state,
+      ) {
+        debug!(
+          "Error processing side-effect change in {:?}: {}",
+          file_path, e
+        );
+      }
+    }
+
+    for symbol_name in &unique_symbols {
+      debug!("Processing symbol '{}' in {:?}", symbol_name, file_path);
+      if let Err(e) = process_changed_symbol(
+        &analyzer,
+        &reference_finder,
+        file_path,
+        symbol_name,
+        &project_index,
+        &mut state,
+      ) {
+        debug!(
+          "Error processing symbol '{}' in {:?}: {}",
+          symbol_name, file_path, e
+        );
       }
     }
   }
@@ -511,8 +556,10 @@ fn find_affected_internal(
             .get(source_file_rel)
             .and_then(|file_imports| {
               file_imports.iter().find_map(|import| {
-                // Check if the import's from_module contains the asset filename
-                if import.from_module.contains(asset_filename) {
+                // Check if the import's from_module contains the asset filename.
+                // A side-effect import (`import "./styles.css"`) binds no name to
+                // trace; the referencing project is already marked above.
+                if !import.is_side_effect() && import.from_module.contains(asset_filename) {
                   debug!(
                     "Found import '{}' (local: '{}') matching asset '{}'",
                     import.from_module, import.local_name, asset_filename
@@ -644,8 +691,11 @@ fn find_affected_internal(
 
             for (file_path, file_imports) in &analyzer.imports {
               // Collect (import, matched canonical dep name) pairs
+              // Side-effect imports of external packages (`import "reflect-metadata"`)
+              // are left out, as they were before they were recorded at all.
               let matching_imports: Vec<_> = file_imports
                 .iter()
+                .filter(|imp| !imp.is_side_effect())
                 .filter_map(|imp| {
                   lockfile::match_affected_dependency(&imp.from_module, &affected_deps)
                     .map(|dep| (imp, dep))
@@ -788,7 +838,10 @@ fn find_affected_internal(
           .get_or_insert_with(|| {
             let mut by_source: FxHashMap<&Path, Vec<&String>> = FxHashMap::default();
             for (source, name) in analyzer.import_index.keys() {
-              by_source.entry(source.as_path()).or_default().push(name);
+              // A side-effect import takes no name from the file
+              if name != Import::SIDE_EFFECT {
+                by_source.entry(source.as_path()).or_default().push(name);
+              }
             }
             by_source
           })
@@ -826,8 +879,15 @@ fn find_affected_internal(
         symbols.extend(names_imported_from_file());
       }
 
+      // A side-effect import of a changed alias (`import "@scope/setup"`) now loads
+      // another module: what loading this file does changed.
+      let mut has_side_effect_import = false;
       for import in analyzer.imports.get(file_path).into_iter().flatten() {
         if !uses_alias(&import.from_module) {
+          continue;
+        }
+        if import.is_side_effect() {
+          has_side_effect_import = true;
           continue;
         }
         // Traced as a changed symbol: through the code in this file that uses
@@ -880,6 +940,30 @@ fn find_affected_internal(
           &mut state,
         ) {
           debug!("Error tracing path-alias symbol '{}': {}", sym, e);
+        }
+      }
+
+      if has_side_effect_import {
+        let mut state = AffectedState {
+          affected_packages: &mut affected_packages,
+          project_causes: if generate_report {
+            Some(&mut project_causes)
+          } else {
+            None
+          },
+          visited: &mut alias_visited,
+        };
+        if let Err(e) = process_side_effect_change(
+          &analyzer,
+          &reference_finder,
+          file_path,
+          &project_index,
+          &mut state,
+        ) {
+          debug!(
+            "Error tracing the path-alias side-effect import of {:?}: {}",
+            file_path, e
+          );
         }
       }
     }
@@ -1065,6 +1149,10 @@ fn process_changed_symbol(
 
   debug!("Processing symbol '{}' in {:?}", symbol_name, file_path);
 
+  // The file has a changed symbol, so files importing it for its side effects
+  // depend on a changed module.
+  propagate_to_side_effect_importers(analyzer, reference_finder, file_path, project_index, state)?;
+
   // Get the source projects for causality tracking (may be multiple with shared sourceRoot)
   let source_projects = project_index.get_package_names_by_path(file_path);
 
@@ -1080,6 +1168,11 @@ fn process_changed_symbol(
     // Find the root symbol containing this reference
     let container_symbols =
       analyzer.find_node_at_line(file_path, local_ref.line, local_ref.column)?;
+    // Used by top-level code outside every symbol (`console.log(helper())`):
+    // what loading the module does changed.
+    if container_symbols.is_empty() && analyzer.is_side_effect_line(file_path, local_ref.line) {
+      process_side_effect_change(analyzer, reference_finder, file_path, project_index, state)?;
+    }
     for container_symbol in container_symbols {
       // Skip if it's the same symbol (self-reference)
       if container_symbol != symbol_name {
@@ -1180,39 +1273,30 @@ fn process_changed_symbol(
         "File {:?} is conservatively affected (entire-file sentinel). Processing all its exports.",
         reference.file_path
       );
-
-      // Get all exports from the affected file
-      if let Some(exports) = analyzer.exports.get(&reference.file_path) {
-        for export in exports {
-          // Skip re-exports - those are handled separately
-          if export.re_export_from.is_some() {
-            continue;
-          }
-
-          // Get the local name (what's actually defined in the file)
-          let local_name = export.local_name.as_ref().unwrap_or(&export.exported_name);
-
-          debug!(
-            "Processing exported symbol '{}' from conservatively affected file {:?}",
-            local_name, reference.file_path
-          );
-
-          // Recursively process this exported symbol
-          process_changed_symbol(
-            analyzer,
-            reference_finder,
-            &reference.file_path,
-            local_name,
-            project_index,
-            state,
-          )?;
-        }
-      }
+      process_changed_file(
+        analyzer,
+        reference_finder,
+        &reference.file_path,
+        project_index,
+        state,
+      )?;
     } else {
       // Normal case: find the root symbol containing this reference in the other file
       if let Ok(container_symbols) =
         analyzer.find_node_at_line(&reference.file_path, reference.line, reference.column)
       {
+        // Used by top-level code of the importing file, as for local references
+        if container_symbols.is_empty()
+          && analyzer.is_side_effect_line(&reference.file_path, reference.line)
+        {
+          process_side_effect_change(
+            analyzer,
+            reference_finder,
+            &reference.file_path,
+            project_index,
+            state,
+          )?;
+        }
         for container_symbol in container_symbols {
           debug!(
             "Cross-file reference in '{}' at {:?}:{}",
@@ -1233,6 +1317,181 @@ fn process_changed_symbol(
   }
 
   Ok(())
+}
+
+/// Visited-set key marking a file already processed as changed as a whole. Not a
+/// valid identifier, so it cannot collide with a traced symbol.
+const WHOLE_FILE_KEY: &str = "<whole-file>";
+
+/// Visited-set key marking a file already processed as having a side-effect
+/// change. Not a valid identifier either.
+const SIDE_EFFECT_CHANGE_KEY: &str = "<side-effect-change>";
+
+/// `symbol` of the `ImportedSymbol` cause recorded for a file that depends on the
+/// whole of a changed module (side-effect import, side-effect change) rather than
+/// on one of its symbols.
+const WHOLE_MODULE_SYMBOL: &str = "*";
+
+/// Treat `file_path` as changed as a whole: trace every symbol it exports, and
+/// reach the files importing it for its side effects. Re-exports are skipped: they
+/// forward another module's symbols, which are traced on their own.
+///
+/// This is also what the entire-file sentinel of a reference (`line == 0`) means.
+fn process_changed_file(
+  analyzer: &WorkspaceAnalyzer,
+  reference_finder: &ReferenceFinder,
+  file_path: &Path,
+  project_index: &ProjectIndex,
+  state: &mut AffectedState,
+) -> Result<()> {
+  if !state
+    .visited
+    .insert((file_path.to_path_buf(), WHOLE_FILE_KEY.to_string()))
+  {
+    return Ok(());
+  }
+
+  propagate_to_side_effect_importers(analyzer, reference_finder, file_path, project_index, state)?;
+
+  if let Some(exports) = analyzer.exports.get(file_path) {
+    for export in exports {
+      if export.re_export_from.is_some() {
+        continue;
+      }
+      // The local name is what the file declares (`export { local as exported }`)
+      let local_name = export.local_name.as_ref().unwrap_or(&export.exported_name);
+      debug!(
+        "Processing exported symbol '{}' of {:?}, changed as a whole",
+        local_name, file_path
+      );
+      process_changed_symbol(
+        analyzer,
+        reference_finder,
+        file_path,
+        local_name,
+        project_index,
+        state,
+      )?;
+    }
+  }
+
+  Ok(())
+}
+
+/// `file_path` changed (a symbol of it, its side effects, or the file as a whole).
+/// A file importing it for its side effects (`import "./file"`) depends on all of
+/// it: loading the importer runs the changed module, so the importer's own
+/// side effects changed. Each such importer gets a side-effect change.
+///
+/// A dynamic `import("./file")` of a module exporting nothing (a script run for its
+/// effects) can only be for its side effects too, so it counts as one. Dynamic
+/// imports of modules with exports keep their lazy boundary.
+fn propagate_to_side_effect_importers(
+  analyzer: &WorkspaceAnalyzer,
+  reference_finder: &ReferenceFinder,
+  file_path: &Path,
+  project_index: &ProjectIndex,
+  state: &mut AffectedState,
+) -> Result<()> {
+  let key = (file_path.to_path_buf(), Import::SIDE_EFFECT.to_string());
+  if !state.visited.insert(key.clone()) {
+    return Ok(());
+  }
+
+  let static_importers = analyzer.import_index.get(&key).into_iter().flatten();
+  let exports_nothing = analyzer
+    .exports
+    .get(file_path)
+    .is_none_or(|exports| exports.is_empty());
+  let dynamic_importers = analyzer
+    .import_index
+    .get(&(file_path.to_path_buf(), "*".to_string()))
+    .into_iter()
+    .flatten()
+    .filter(|(_, _, _, is_dynamic)| exports_nothing && *is_dynamic);
+
+  for (importing_file, ..) in static_importers.chain(dynamic_importers) {
+    debug!(
+      "{:?} imports changed {:?} for its side effects",
+      importing_file, file_path
+    );
+    record_whole_module_dependent(project_index, importing_file, file_path, state);
+    process_side_effect_change(
+      analyzer,
+      reference_finder,
+      importing_file,
+      project_index,
+      state,
+    )?;
+  }
+
+  Ok(())
+}
+
+/// What loading `file_path` does changed: top-level code outside every symbol
+/// changed (`console.log(helper())`, an added or removed `import "./setup"`), or
+/// it imports a changed module for its side effects. The file is changed as a
+/// whole, and so is every file statically loading it, whatever it imports
+/// (named, default or namespace import). Side-effect importers are reached
+/// through [`process_changed_file`], as a side-effect change of their own.
+fn process_side_effect_change(
+  analyzer: &WorkspaceAnalyzer,
+  reference_finder: &ReferenceFinder,
+  file_path: &Path,
+  project_index: &ProjectIndex,
+  state: &mut AffectedState,
+) -> Result<()> {
+  if !state
+    .visited
+    .insert((file_path.to_path_buf(), SIDE_EFFECT_CHANGE_KEY.to_string()))
+  {
+    return Ok(());
+  }
+
+  for importing_file in analyzer.binding_importers_of(file_path) {
+    debug!(
+      "{:?} imports {:?}, whose side effects changed",
+      importing_file, file_path
+    );
+    record_whole_module_dependent(project_index, importing_file, file_path, state);
+    process_changed_file(
+      analyzer,
+      reference_finder,
+      importing_file,
+      project_index,
+      state,
+    )?;
+  }
+
+  process_changed_file(analyzer, reference_finder, file_path, project_index, state)
+}
+
+/// Mark the projects owning `importing_file`, which depends on the whole of the
+/// changed `source_file`, affected, with an `ImportedSymbol` cause naming the
+/// whole module.
+fn record_whole_module_dependent(
+  project_index: &ProjectIndex,
+  importing_file: &Path,
+  source_file: &Path,
+  state: &mut AffectedState,
+) {
+  let source_projects = project_index.get_package_names_by_path(source_file);
+  for pkg in project_index.get_package_names_by_path(importing_file) {
+    if let Some(ref mut causes_map) = state.project_causes {
+      for source_project in &source_projects {
+        causes_map
+          .entry(pkg.clone())
+          .or_default()
+          .push(AffectCause::ImportedSymbol {
+            source_project: source_project.clone(),
+            symbol: WHOLE_MODULE_SYMBOL.to_string(),
+            via_file: importing_file.to_path_buf(),
+            source_file: source_file.to_path_buf(),
+          });
+      }
+    }
+    state.affected_packages.insert(pkg);
+  }
 }
 
 /// Whether an Nx `implicitDependencies` entry should be treated as a glob
