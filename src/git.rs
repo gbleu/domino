@@ -254,8 +254,13 @@ fn parse_diff(diff: &str) -> Result<Vec<ChangedFile>> {
       // — rather than anchoring to a surviving new-side line — is what makes
       // deleting a whole symbol resolvable and avoids mis-attributing the change
       // to whichever symbol now happens to occupy the deletion point.
+      //
+      // A replacement hunk (`Y >= 1` and `W >= 1`) also records its old-side
+      // lines in `replaced_lines`: the new side shows what replaced them, not
+      // whether a top-level side effect was removed.
       let mut changed_lines: Vec<usize> = Vec::new();
       let mut deleted_lines: Vec<usize> = Vec::new();
+      let mut replaced_lines: Vec<usize> = Vec::new();
       let parse_group = |caps: &regex::Captures, idx: usize| -> Option<usize> {
         caps.get(idx).and_then(|m| {
           m.as_str()
@@ -275,6 +280,10 @@ fn parse_diff(diff: &str) -> Result<Vec<ChangedFile>> {
           deleted_lines.extend(old_start..old_start + old_count);
         } else {
           changed_lines.extend(new_start..new_start + new_count);
+          // `-X,0` (pure addition) has no old side.
+          if old_count > 0 {
+            replaced_lines.extend(old_start..old_start + old_count);
+          }
         }
       }
 
@@ -302,12 +311,14 @@ fn parse_diff(diff: &str) -> Result<Vec<ChangedFile>> {
         file_path: file_path.into(),
         changed_lines,
         deleted_lines,
+        replaced_lines,
       }];
       if let Some(old_path) = renamed_from {
         entries.push(ChangedFile {
           file_path: old_path.into(),
           changed_lines: Vec::new(),
           deleted_lines: Vec::new(),
+          replaced_lines: Vec::new(),
         });
       }
       Some(entries)
@@ -659,6 +670,31 @@ index 1234567..abcdefg 100644
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].changed_lines, vec![21, 22]);
     assert_eq!(result[0].deleted_lines, vec![5, 6, 7]);
+  }
+
+  /// A replacement hunk records its new-side lines in `changed_lines` and its
+  /// old-side lines in `replaced_lines`, never in `deleted_lines`. A pure
+  /// addition (`-X,0`) has no old side to record.
+  #[test]
+  fn test_parse_diff_replacement_hunk_records_old_side_in_replaced_lines() {
+    let diff = r#"diff --git a/src/foo.ts b/src/foo.ts
+index 1234567..abcdefg 100644
+--- a/src/foo.ts
++++ b/src/foo.ts
+@@ -4,2 +4,1 @@ prefix
+-  removed one
+-  removed two
++  added one
+@@ -10,0 +10,2 @@ suffix
++  added two
++  added three
+"#;
+
+    let result = parse_diff(diff).unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].changed_lines, vec![4, 10, 11]);
+    assert_eq!(result[0].replaced_lines, vec![4, 5]);
+    assert!(result[0].deleted_lines.is_empty());
   }
 
   /// A file whose only hunks are deletions (`+Z,0`) is kept in the result with

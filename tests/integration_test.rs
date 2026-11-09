@@ -8812,3 +8812,84 @@ fn test_side_effect_change_skips_type_only_reexport() {
     "a type-only re-export is erased at compile time, so the barrel does not load the changed module"
   );
 }
+
+#[test]
+fn test_side_effect_replaced_by_declaration_reaches_importers() {
+  let via_files = side_effect_via_files(
+    &[
+      (
+        "mod.ts",
+        "export function other() {\n  return 1;\n}\n\nglobalThis.flag = true;\n",
+      ),
+      (
+        "app.ts",
+        "import { other } from \"./mod\";\n\nexport function app() {\n  return other();\n}\n",
+      ),
+      ("app.spec.ts", "import { app } from \"./app\";\n\napp();\n"),
+    ],
+    &[(
+      "mod.ts",
+      Some("export function other() {\n  return 1;\n}\n\nconst timeout = 1000;\n"),
+    )],
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&["app.spec.ts", "app.ts"]),
+    "replacing a top-level side effect removes it, so importers are affected"
+  );
+}
+
+#[test]
+fn test_side_effect_import_replaced_by_binding_import_reaches_importers() {
+  let via_files = side_effect_via_files(
+    &[
+      ("register.ts", "globalThis.registered = true;\n"),
+      ("helper.ts", "export function helper() {\n  return 1;\n}\n"),
+      (
+        "mod.ts",
+        "import \"./register\";\n\nexport function other() {\n  return 1;\n}\n",
+      ),
+      ("app.ts", "import { other } from \"./mod\";\n\nexport function app() {\n  return other();\n}\n"),
+      ("app.spec.ts", "import { app } from \"./app\";\n\napp();\n"),
+    ],
+    &[(
+      "mod.ts",
+      Some(
+        "import { helper } from \"./helper\";\n\nexport function other() {\n  return 1;\n}\n\nexport function extra() {\n  return helper();\n}\n",
+      ),
+    )],
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&["app.spec.ts", "app.ts"]),
+    "replacing a side-effect import stops loading that module, so importers are affected"
+  );
+}
+
+#[test]
+fn test_replaced_declaration_keeps_named_import_precision() {
+  let via_files = side_effect_via_files(
+    &[
+      (
+        "mod.ts",
+        "export function other() {\n  return 1;\n}\n\nconst timeout = 1000;\n",
+      ),
+      (
+        "app.ts",
+        "import { other } from \"./mod\";\n\nexport function app() {\n  return other();\n}\n",
+      ),
+      ("app.spec.ts", "import { app } from \"./app\";\n\napp();\n"),
+    ],
+    &[(
+      "mod.ts",
+      Some("export function other() {\n  return 1;\n}\n\nconst timeout = 2000;\n"),
+    )],
+  );
+
+  assert!(
+    via_files.is_empty(),
+    "replacing a declaration removes no side effect, so only its own dependents are affected"
+  );
+}
