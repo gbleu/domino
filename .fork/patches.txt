@@ -1,3 +1,4 @@
+fix(semantic): ignore type-only re-exports for side-effect changes | not submitted
 fix(semantic): carry side-effect changes through importers that re-export | not submitted
 fix(semantic): carry side-effect changes through re-exporting barrels | not submitted
 fix(semantic): treat re-exports as loading the module for side-effect changes | not submitted
