@@ -32,6 +32,7 @@ exempt: they land by force-push, and their commits against `main` are upstream's
 
 | Patch | Upstream PR | State |
 | --- | --- | --- |
+| `refactor(semantic): check deleted and replaced lines in one pass` | not submitted | worth sending with the replacement-hunk patch |
 | `fix(git): keep the old side of replacement hunks` | not submitted | worth sending; upstream's `parse_diff` also keeps the old side of pure-deletion hunks only |
 | `fix(semantic): ignore type-only re-exports for side-effect changes` | not submitted | worth sending with the side-effect patch; addresses upstream #103, still open at `v2.2.0` |
 | `fix(semantic): carry side-effect changes through importers that re-export` | not submitted | worth sending with the side-effect patch; addresses upstream #103, still open at `v2.2.0` |
