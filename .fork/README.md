@@ -32,6 +32,7 @@ exempt: they land by force-push, and their commits against `main` are upstream's
 
 | Patch | Upstream PR | State |
 | --- | --- | --- |
+| `fix(semantic): carry side-effect changes through importers that re-export` | not submitted | worth sending with the side-effect patch; addresses upstream #103, still open at `v2.2.0` |
 | `fix(semantic): carry side-effect changes through re-exporting barrels` | not submitted | worth sending with the side-effect patch; addresses upstream #103, still open at `v2.2.0` |
 | `fix(semantic): treat re-exports as loading the module for side-effect changes` | not submitted | worth sending with the side-effect patch; addresses upstream #103, still open at `v2.2.0` |
 | `fix(semantic): carry side-effect changes through importers without exports` | not submitted | worth sending with the side-effect patch; addresses upstream #103, still open at `v2.2.0` |

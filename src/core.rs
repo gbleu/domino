@@ -1455,20 +1455,13 @@ fn process_side_effect_change(
     );
     record_whole_module_dependent(project_index, importing_file, file_path, state);
     // Whatever loads this importer still runs the changed side effects. Carry
-    // the change through it when tracing its exports cannot: it has none, or
-    // it re-exports the changed module (its consumers load that module whatever
-    // name they import).
-    let exports_nothing = analyzer
-      .exports
-      .get(importing_file)
-      .is_none_or(|exports| exports.is_empty());
-    let reexports_file = || {
-      analyzer
-        .reexport_index
-        .get(file_path)
-        .is_some_and(|reexports| reexports.iter().any(|(barrel, _)| barrel == importing_file))
-    };
-    if exports_nothing || reexports_file() {
+    // the change through it when tracing its exports cannot reach all of its
+    // consumers: it has none, or it re-exports (tracing skips re-exports, yet
+    // their consumers load the importer too).
+    let carry_through = analyzer.exports.get(importing_file).is_none_or(|exports| {
+      exports.is_empty() || exports.iter().any(|e| e.re_export_from.is_some())
+    });
+    if carry_through {
       process_side_effect_change(
         analyzer,
         reference_finder,

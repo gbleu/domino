@@ -8638,3 +8638,67 @@ fn test_side_effect_change_reaches_consumers_of_reexported_name_in_mixed_barrel(
     "a mixed barrel loads the changed module, so consumers of a re-exported name run the changed side effects"
   );
 }
+
+#[test]
+fn test_side_effect_change_reaches_consumers_of_name_reexported_from_another_module() {
+  let via_files = side_effect_via_files(
+    &[
+      (
+        "setup.ts",
+        "export function setup() {\n  return true;\n}\n\nconsole.log(\"setup\");\n",
+      ),
+      ("button.ts", "export const button = true;\n"),
+      (
+        "lib.ts",
+        "import { setup } from \"./setup\";\n\nexport const own = () => setup();\nexport { button } from \"./button\";\n",
+      ),
+      (
+        "app.ts",
+        "import { button } from \"./lib\";\n\nexport function app() {\n  return button;\n}\n",
+      ),
+      ("app.spec.ts", "import { app } from \"./app\";\n\napp();\n"),
+    ],
+    &[(
+      "setup.ts",
+      Some("export function setup() {\n  return true;\n}\n\nconsole.log(\"setup v2\");\n"),
+    )],
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&["app.spec.ts", "app.ts", "lib.ts"]),
+    "consumers of a name re-exported from another module still load the importer, so they run the changed side effects"
+  );
+}
+
+#[test]
+fn test_side_effect_change_reaches_consumers_of_star_reexport_from_another_module() {
+  let via_files = side_effect_via_files(
+    &[
+      (
+        "setup.ts",
+        "export function setup() {\n  return true;\n}\n\nconsole.log(\"setup\");\n",
+      ),
+      ("button.ts", "export const button = true;\n"),
+      (
+        "lib.ts",
+        "import { setup } from \"./setup\";\n\nexport * from \"./button\";\n\nfunction init() {\n  return setup();\n}\n",
+      ),
+      (
+        "app.ts",
+        "import { button } from \"./lib\";\n\nexport function app() {\n  return button;\n}\n",
+      ),
+      ("app.spec.ts", "import { app } from \"./app\";\n\napp();\n"),
+    ],
+    &[(
+      "setup.ts",
+      Some("export function setup() {\n  return true;\n}\n\nconsole.log(\"setup v2\");\n"),
+    )],
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&["app.spec.ts", "app.ts", "lib.ts"]),
+    "consumers of an `export *` from another module still load the importer, so they run the changed side effects"
+  );
+}
