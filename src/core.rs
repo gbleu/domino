@@ -407,10 +407,11 @@ fn find_affected_internal(
     unique_symbols.extend(deleted_symbols.iter());
 
     debug!(
-      "Found {} unique symbols from {} changed and {} deleted lines in {:?} (side-effect change: {})",
+      "Found {} unique symbols from {} changed, {} deleted and {} replaced lines in {:?} (side-effect change: {})",
       unique_symbols.len(),
       changed_file.changed_lines.len(),
       changed_file.deleted_lines.len(),
+      changed_file.replaced_lines.len(),
       file_path,
       has_side_effect_change
     );

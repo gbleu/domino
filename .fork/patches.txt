@@ -1,3 +1,4 @@
+refactor(semantic): check deleted and replaced lines in one pass | not submitted
 fix(git): keep the old side of replacement hunks | not submitted
 fix(semantic): ignore type-only re-exports for side-effect changes | not submitted
 fix(semantic): carry side-effect changes through importers that re-export | not submitted

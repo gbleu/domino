@@ -1355,8 +1355,9 @@ impl WorkspaceAnalyzer {
   /// side-effect statement (removing `import "./setup"`, say) sets
   /// [`DeletedChanges::has_side_effect`], with the same rule as
   /// [`WorkspaceAnalyzer::is_side_effect_line`]. `replaced_lines`, the old side
-  /// of replacement hunks, are checked for that alone: whatever replaced them
-  /// is resolved on the new side.
+  /// of replacement hunks, are checked for that alone: the symbols they resolve
+  /// to are not recovered, so a symbol renamed or removed by a replacement hunk
+  /// is not traced.
   pub fn find_deleted_changes(
     &self,
     file_path: &Path,
@@ -1377,31 +1378,34 @@ impl WorkspaceAnalyzer {
       }
     };
 
-    for &line in deleted_lines {
+    // Deleted lines recover symbols; replaced lines only a removed side effect.
+    let lines = deleted_lines
+      .iter()
+      .map(|&line| (line, true))
+      .chain(replaced_lines.iter().map(|&line| (line, false)));
+    for (line, recover_symbols) in lines {
+      if !recover_symbols && changes.has_side_effect {
+        break;
+      }
       match Self::find_top_level_symbols(&file_data, line, 0) {
         Ok(names) if names.is_empty() => {
           if !changes.has_side_effect && Self::is_top_level_side_effect_at_line(&file_data, line) {
             changes.has_side_effect = true;
           }
         }
-        Ok(names) => {
+        Ok(names) if recover_symbols => {
           for name in names {
             if !changes.symbols.contains(&name) {
               changes.symbols.push(name);
             }
           }
         }
+        Ok(_) => {}
         Err(e) => debug!(
-          "Error resolving deleted symbol at base line {} in {:?}: {}",
+          "Error resolving symbol at base line {} in {:?}: {}",
           line, file_path, e
         ),
       }
-    }
-    if !changes.has_side_effect {
-      changes.has_side_effect = replaced_lines.iter().any(|&line| {
-        Self::find_top_level_symbols(&file_data, line, 0).is_ok_and(|names| names.is_empty())
-          && Self::is_top_level_side_effect_at_line(&file_data, line)
-      });
     }
     changes
   }
