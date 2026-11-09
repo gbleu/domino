@@ -8574,3 +8574,67 @@ fn test_unrelated_symbol_change_keeps_named_import_precision() {
     "without a side-effect change, only importers of the changed symbol are affected"
   );
 }
+
+#[test]
+fn test_side_effect_change_reaches_consumers_of_pure_reexport_barrel() {
+  let via_files = side_effect_via_files(
+    &[
+      (
+        "widget.ts",
+        "export function widget() {\n  return true;\n}\n\nconsole.log(\"widget\");\n",
+      ),
+      ("ready.ts", "export const ready = true;\n"),
+      (
+        "index.ts",
+        "export * from \"./widget\";\nexport * from \"./ready\";\n",
+      ),
+      (
+        "app.ts",
+        "import { ready } from \"./index\";\n\nexport function app() {\n  return ready;\n}\n",
+      ),
+      ("app.spec.ts", "import { app } from \"./app\";\n\napp();\n"),
+    ],
+    &[(
+      "widget.ts",
+      Some("export function widget() {\n  return true;\n}\n\nconsole.log(\"widget v2\");\n"),
+    )],
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&["app.spec.ts", "app.ts", "index.ts"]),
+    "a barrel made only of re-exports loads the changed module, so its consumers run the changed side effects"
+  );
+}
+
+#[test]
+fn test_side_effect_change_reaches_consumers_of_reexported_name_in_mixed_barrel() {
+  let via_files = side_effect_via_files(
+    &[
+      (
+        "widget.ts",
+        "export function widget() {\n  return true;\n}\n\nconsole.log(\"widget\");\n",
+      ),
+      ("ready.ts", "export const ready = true;\n"),
+      (
+        "index.ts",
+        "export { widget } from \"./widget\";\nexport { ready } from \"./ready\";\nexport const own = 1;\n",
+      ),
+      (
+        "app.ts",
+        "import { ready } from \"./index\";\n\nexport function app() {\n  return ready;\n}\n",
+      ),
+      ("app.spec.ts", "import { app } from \"./app\";\n\napp();\n"),
+    ],
+    &[(
+      "widget.ts",
+      Some("export function widget() {\n  return true;\n}\n\nconsole.log(\"widget v2\");\n"),
+    )],
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&["app.spec.ts", "app.ts", "index.ts"]),
+    "a mixed barrel loads the changed module, so consumers of a re-exported name run the changed side effects"
+  );
+}
