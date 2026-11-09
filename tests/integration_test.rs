@@ -8702,3 +8702,34 @@ fn test_side_effect_change_reaches_consumers_of_star_reexport_from_another_modul
     "consumers of an `export *` from another module still load the importer, so they run the changed side effects"
   );
 }
+
+#[test]
+fn test_side_effect_change_skips_type_only_reexport() {
+  let via_files = side_effect_via_files(
+    &[
+      (
+        "setup.ts",
+        "export type Shape = { size: number };\n\nconsole.log(\"setup\");\n",
+      ),
+      ("button.ts", "export const button = true;\n"),
+      (
+        "lib.ts",
+        "export type { Shape } from \"./setup\";\nexport { button } from \"./button\";\n",
+      ),
+      (
+        "app.ts",
+        "import { button } from \"./lib\";\n\nexport function app() {\n  return button;\n}\n",
+      ),
+      ("app.spec.ts", "import { app } from \"./app\";\n\napp();\n"),
+    ],
+    &[(
+      "setup.ts",
+      Some("export type Shape = { size: number };\n\nconsole.log(\"setup v2\");\n"),
+    )],
+  );
+
+  assert!(
+    via_files.is_empty(),
+    "a type-only re-export is erased at compile time, so the barrel does not load the changed module"
+  );
+}

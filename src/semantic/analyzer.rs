@@ -374,9 +374,13 @@ impl WorkspaceAnalyzer {
       }
     }
     // A re-export (`export { f } from "./x"`, `export * from "./x"`) loads the
-    // module too, so the barrel runs the source's side effects.
+    // module too, so the barrel runs the source's side effects. A type-only one
+    // is erased at compile time and loads nothing.
     for (source_file, reexports) in &self.reexport_index {
-      for (reexporting_file, _export) in reexports {
+      for (reexporting_file, export) in reexports {
+        if export.is_type_only {
+          continue;
+        }
         index
           .entry(source_file.clone())
           .or_default()
@@ -754,6 +758,7 @@ impl WorkspaceAnalyzer {
             exported_name: "default".to_string(),
             local_name: None,
             re_export_from: None,
+            is_type_only: false,
           });
         }
         oxc_ast::ast::Statement::ExportAllDeclaration(export_all) => {
@@ -762,6 +767,7 @@ impl WorkspaceAnalyzer {
             exported_name: "*".to_string(),
             local_name: None,
             re_export_from: Some(from),
+            is_type_only: export_all.export_kind.is_type(),
           });
         }
         _ => {}
@@ -787,6 +793,7 @@ impl WorkspaceAnalyzer {
         exported_name,
         local_name,
         re_export_from: re_export_from.clone(),
+        is_type_only: export_decl.export_kind.is_type() || specifier.export_kind.is_type(),
       });
     }
 
@@ -800,6 +807,7 @@ impl WorkspaceAnalyzer {
                 exported_name: id.name.to_string(),
                 local_name: None,
                 re_export_from: None,
+                is_type_only: false,
               });
             }
           }
@@ -810,6 +818,7 @@ impl WorkspaceAnalyzer {
               exported_name: id.name.to_string(),
               local_name: None,
               re_export_from: None,
+              is_type_only: false,
             });
           }
         }
@@ -819,6 +828,7 @@ impl WorkspaceAnalyzer {
               exported_name: id.name.to_string(),
               local_name: None,
               re_export_from: None,
+              is_type_only: false,
             });
           }
         }
