@@ -1461,7 +1461,10 @@ fn process_side_effect_change(
     // consumers: it has none, or it re-exports (tracing skips re-exports, yet
     // their consumers load the importer too).
     let carry_through = analyzer.exports.get(importing_file).is_none_or(|exports| {
-      exports.is_empty() || exports.iter().any(|e| e.re_export_from.is_some())
+      exports.is_empty()
+        || exports
+          .iter()
+          .any(|e| e.re_export_from.is_some() && !e.is_type_only)
     });
     if carry_through {
       process_side_effect_change(

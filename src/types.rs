@@ -195,6 +195,10 @@ pub struct Export {
   pub local_name: Option<String>,
   /// If this is a re-export, the module it's re-exported from
   pub re_export_from: Option<String>,
+  /// Whether the export is type-only (`export type { A } from`,
+  /// `export { type A } from`, `export type * from`). It is erased at compile
+  /// time, so a type-only re-export does not load its module.
+  pub is_type_only: bool,
 }
 
 /// Configuration for the true affected algorithm
