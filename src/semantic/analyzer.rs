@@ -1354,15 +1354,18 @@ impl WorkspaceAnalyzer {
   /// A deleted line that resolves to no symbol but belonged to a top-level
   /// side-effect statement (removing `import "./setup"`, say) sets
   /// [`DeletedChanges::has_side_effect`], with the same rule as
-  /// [`WorkspaceAnalyzer::is_side_effect_line`].
+  /// [`WorkspaceAnalyzer::is_side_effect_line`]. `replaced_lines`, the old side
+  /// of replacement hunks, are checked for that alone: whatever replaced them
+  /// is resolved on the new side.
   pub fn find_deleted_changes(
     &self,
     file_path: &Path,
     base_source: &str,
     deleted_lines: &[usize],
+    replaced_lines: &[usize],
   ) -> DeletedChanges {
     let mut changes = DeletedChanges::default();
-    if deleted_lines.is_empty() {
+    if deleted_lines.is_empty() && replaced_lines.is_empty() {
       return changes;
     }
 
@@ -1393,6 +1396,12 @@ impl WorkspaceAnalyzer {
           line, file_path, e
         ),
       }
+    }
+    if !changes.has_side_effect {
+      changes.has_side_effect = replaced_lines.iter().any(|&line| {
+        Self::find_top_level_symbols(&file_data, line, 0).is_ok_and(|names| names.is_empty())
+          && Self::is_top_level_side_effect_at_line(&file_data, line)
+      });
     }
     changes
   }
@@ -1743,7 +1752,7 @@ export const Kept = 2;
     let analyzer =
       WorkspaceAnalyzer::new(vec![], Path::new("."), profiler).expect("Failed to create analyzer");
 
-    let changes = analyzer.find_deleted_changes(Path::new("gone.ts"), base_source, &[1, 2, 3]);
+    let changes = analyzer.find_deleted_changes(Path::new("gone.ts"), base_source, &[1, 2, 3], &[]);
     assert_eq!(changes.symbols, vec!["Removed".to_string()]);
     assert!(!changes.has_side_effect);
   }
@@ -1763,7 +1772,7 @@ export const Kept = 2;
     let analyzer =
       WorkspaceAnalyzer::new(vec![], Path::new("."), profiler).expect("Failed to create analyzer");
 
-    let changes = analyzer.find_deleted_changes(Path::new("table.ts"), base_source, &[3]);
+    let changes = analyzer.find_deleted_changes(Path::new("table.ts"), base_source, &[3], &[]);
     assert_eq!(changes.symbols, vec!["TABLE".to_string()]);
     assert!(!changes.has_side_effect);
   }
@@ -1836,7 +1845,7 @@ export const Kept = 2;
     let analyzer =
       WorkspaceAnalyzer::new(vec![], Path::new("."), profiler).expect("Failed to create analyzer");
 
-    let changes = analyzer.find_deleted_changes(Path::new("index.ts"), base_source, &[1]);
+    let changes = analyzer.find_deleted_changes(Path::new("index.ts"), base_source, &[1], &[]);
     assert_eq!(
       changes,
       DeletedChanges {
@@ -1852,7 +1861,8 @@ export const Kept = 2;
     let profiler = Arc::new(Profiler::new(false));
     let analyzer =
       WorkspaceAnalyzer::new(vec![], Path::new("."), profiler).expect("Failed to create analyzer");
-    let changes = analyzer.find_deleted_changes(Path::new("x.ts"), "export const A = 1;\n", &[]);
+    let changes =
+      analyzer.find_deleted_changes(Path::new("x.ts"), "export const A = 1;\n", &[], &[]);
     assert_eq!(changes, DeletedChanges::default());
   }
 

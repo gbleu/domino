@@ -802,21 +802,25 @@ mod tests {
         file_path: PathBuf::from(".github/workflows/ci.yml"),
         changed_lines: vec![],
         deleted_lines: vec![],
+        replaced_lines: vec![],
       },
       ChangedFile {
         file_path: PathBuf::from("nx.json"),
         changed_lines: vec![],
         deleted_lines: vec![],
+        replaced_lines: vec![],
       },
       ChangedFile {
         file_path: PathBuf::from("package.json"),
         changed_lines: vec![],
         deleted_lines: vec![],
+        replaced_lines: vec![],
       },
       ChangedFile {
         file_path: PathBuf::from("libs/foo/src/index.ts"),
         changed_lines: vec![],
         deleted_lines: vec![],
+        replaced_lines: vec![],
       },
     ];
 
@@ -850,6 +854,7 @@ mod tests {
       file_path: PathBuf::from(path),
       changed_lines: vec![1],
       deleted_lines: vec![],
+      replaced_lines: vec![],
     }
   }
 
@@ -909,6 +914,7 @@ mod tests {
       file_path: PathBuf::from("libs/foo/src/index.ts"),
       changed_lines: vec![],
       deleted_lines: vec![],
+      replaced_lines: vec![],
     }];
 
     assert!(check_global_invalidation(&resolved, &changed).is_empty());

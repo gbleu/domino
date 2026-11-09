@@ -283,6 +283,21 @@ fn find_affected_internal(
       )
       .collect();
 
+    // A changed or deleted line outside every symbol that belongs to top-level
+    // side-effect code (`import "./setup"`, `console.log(helper())`) changes
+    // what loading the module does, which no symbol trace carries. See
+    // `process_side_effect_change`.
+    let new_side_effect = symbols_by_line
+      .iter()
+      .any(|(line, symbols)| symbols.is_empty() && analyzer.is_side_effect_line(file_path, *line));
+    // The old side of replacement hunks is only checked for a removed side
+    // effect, so it is not needed once the new side shows one.
+    let replaced_lines: &[usize] = if new_side_effect {
+      &[]
+    } else {
+      &changed_file.replaced_lines
+    };
+
     // Recover symbols removed by pure-deletion hunks. Their lines are gone from
     // the working tree, so `find_node_at_line` above (which reads the current
     // file) can't see them; instead we re-parse the file at the base revision
@@ -290,13 +305,16 @@ fn find_affected_internal(
     // what lets dependents of a deleted symbol — an object property, a `switch`
     // case, or a whole exported declaration — be traced. Consumers still import
     // the symbol in the current graph, so the traversal below reaches them.
-    let deleted_changes = if changed_file.deleted_lines.is_empty() {
+    let deleted_changes = if changed_file.deleted_lines.is_empty() && replaced_lines.is_empty() {
       DeletedChanges::default()
     } else {
       match git::get_file_at_revision(&config.cwd, &merge_base, file_path) {
-        Ok(Some(base_source)) => {
-          analyzer.find_deleted_changes(file_path, &base_source, &changed_file.deleted_lines)
-        }
+        Ok(Some(base_source)) => analyzer.find_deleted_changes(
+          file_path,
+          &base_source,
+          &changed_file.deleted_lines,
+          replaced_lines,
+        ),
         Ok(None) => DeletedChanges::default(),
         Err(e) => {
           debug!(
@@ -308,15 +326,7 @@ fn find_affected_internal(
       }
     };
     let deleted_symbols = &deleted_changes.symbols;
-
-    // A changed or deleted line outside every symbol that belongs to top-level
-    // side-effect code (`import "./setup"`, `console.log(helper())`) changes
-    // what loading the module does, which no symbol trace carries. See
-    // `process_side_effect_change`.
-    let has_side_effect_change = deleted_changes.has_side_effect
-      || symbols_by_line.iter().any(|(line, symbols)| {
-        symbols.is_empty() && analyzer.is_side_effect_line(file_path, *line)
-      });
+    let has_side_effect_change = new_side_effect || deleted_changes.has_side_effect;
     if !deleted_symbols.is_empty() {
       debug!(
         "Recovered {} deleted symbol(s) from base revision of {:?}: {:?}",

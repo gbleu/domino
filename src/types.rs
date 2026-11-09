@@ -123,6 +123,11 @@ pub struct ChangedFile {
   /// re-parsing the base revision at these lines — which is how dependents of
   /// deleted code are traced. Empty when the change added or modified lines.
   pub deleted_lines: Vec<usize>,
+  /// Old-side (base-revision) line numbers removed by replacement hunks
+  /// (`@@ -X,Y +Z,W @@` with `Y` and `W` both non-zero), 1-indexed. Only used
+  /// to detect a removed top-level side effect: whatever replaced it shows up in
+  /// `changed_lines`, but what was removed does not.
+  pub replaced_lines: Vec<usize>,
 }
 
 /// A reference to a symbol in the code
