@@ -289,8 +289,15 @@ impl<'a> ReferenceFinder<'a> {
           reexporting_file, current_file
         );
         // Recursively look for imports of the re-exporting file
-        // The symbol name stays the same through wildcard re-exports
-        self.find_refs_recursive(symbol_name, reexporting_file, true, all_refs, visited)?;
+        // The symbol name stays the same through wildcard re-exports, and so does
+        // its visibility: `export *` only passes on what `current_file` exports.
+        self.find_refs_recursive(
+          symbol_name,
+          reexporting_file,
+          is_exported,
+          all_refs,
+          visited,
+        )?;
       } else if export.is_namespace_reexport() {
         // `export * as ns from "<current_file>"`: the namespace object is exported
         // as `ns`.
