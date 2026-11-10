@@ -72,11 +72,16 @@ impl<'a> ReferenceFinder<'a> {
     let mut all_refs = Vec::new();
     let mut visited = FxHashSet::default();
 
-    // A symbol the file does not export cannot be read through its namespace
-    // object; a symbol reached through an import or a re-export is exported.
+    // A symbol the file declares without exporting cannot be read through its
+    // namespace object; a symbol reached through an import or a re-export is
+    // exported. One the file no longer declares was removed, which breaks the
+    // code reading it through the namespace, so it counts as exported.
     let is_exported = self
       .analyzer
-      .is_symbol_exported(declaring_file, symbol_name);
+      .is_symbol_exported(declaring_file, symbol_name)
+      || !self
+        .analyzer
+        .declares_top_level_symbol(declaring_file, symbol_name);
     self.find_refs_recursive(
       symbol_name,
       declaring_file,
