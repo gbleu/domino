@@ -3,7 +3,8 @@ use crate::profiler::Profiler;
 use crate::types::{Export, Import, Project, Reference};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-  ExportNamedDeclaration, Expression, ImportDeclaration, ImportDeclarationSpecifier, Statement,
+  BindingPatternKind, ExportNamedDeclaration, Expression, ImportDeclaration,
+  ImportDeclarationSpecifier, JSXMemberExpressionObject, Statement, VariableDeclarator,
 };
 use oxc_ast::AstKind;
 use oxc_ast_visit::walk;
@@ -769,9 +770,17 @@ impl WorkspaceAnalyzer {
         }
         oxc_ast::ast::Statement::ExportAllDeclaration(export_all) => {
           let from = export_all.source.value.as_str().to_string();
+          // `export * as ns from "m"` exports one binding, the namespace object of `m`
+          let (exported_name, local_name) = match &export_all.exported {
+            Some(exported) => (
+              exported.name().to_string(),
+              Some(Export::NAMESPACE.to_string()),
+            ),
+            None => ("*".to_string(), None),
+          };
           exports.push(Export {
-            exported_name: "*".to_string(),
-            local_name: None,
+            exported_name,
+            local_name,
             re_export_from: Some(from),
             is_type_only: export_all.export_kind.is_type(),
           });
@@ -945,8 +954,127 @@ impl WorkspaceAnalyzer {
             }
           }
         }
+        // `<ns.Member />`
+        AstKind::JSXMemberExpression(member_expr)
+          if member_expr.property.name.as_str() == property_name =>
+        {
+          if let JSXMemberExpressionObject::IdentifierReference(ident) = &member_expr.object {
+            if ident.name.as_str() == namespace_name {
+              let (line, column) = self.span_to_line_col(file_data.source(), member_expr.span);
+              references.push(Reference {
+                file_path: file_path.to_path_buf(),
+                line,
+                column,
+              });
+            }
+          }
+        }
+        // `const { Member } = ns` reads `ns.Member`
+        AstKind::VariableDeclarator(declarator) => {
+          if let Some(Expression::Identifier(ident)) = &declarator.init {
+            if ident.name.as_str() == namespace_name
+              && Self::destructured_members(declarator)
+                .is_some_and(|members| members.iter().any(|member| member == property_name))
+            {
+              let (line, column) = self.span_to_line_col(file_data.source(), ident.span);
+              references.push(Reference {
+                file_path: file_path.to_path_buf(),
+                line,
+                column,
+              });
+            }
+          }
+        }
         _ => {}
       }
+    }
+
+    Ok(references)
+  }
+
+  /// The members read by a plain object destructuring declarator
+  /// (`const { a, b: c } = init`), or `None` when it reads more than named
+  /// members: no object pattern, a rest element (`...rest`) or a computed key.
+  fn destructured_members(declarator: &VariableDeclarator) -> Option<Vec<String>> {
+    let BindingPatternKind::ObjectPattern(pattern) = &declarator.id.kind else {
+      return None;
+    };
+    if pattern.rest.is_some() {
+      return None;
+    }
+    pattern
+      .properties
+      .iter()
+      .map(|property| {
+        if property.computed {
+          None
+        } else {
+          property.key.static_name().map(|name| name.into_owned())
+        }
+      })
+      .collect()
+  }
+
+  /// Find the uses of a namespace import binding (`import * as ns from "m"`) as a
+  /// value in its own right, rather than through a static member access.
+  ///
+  /// `ns.member` (`<ns.Member />`, `const { member } = ns`) names one export of
+  /// `m`, and is traced precisely by
+  /// [`WorkspaceAnalyzer::find_namespace_member_access`]. Any other runtime use
+  /// hands the namespace object itself to code that can read any export:
+  /// `register(ns)`, `{ activities: ns }`, `{ ...ns }`, `[ns]`, `ns[key]`,
+  /// `export { ns }`. Such a use references every export of `m`. Type positions
+  /// (`typeof ns`, `ns.Type`) are erased and not returned.
+  ///
+  /// Only the module-scope binding named `namespace_name` is considered, which is
+  /// where an import binding lives: a shadowing local of the same name is a
+  /// different symbol.
+  pub fn find_namespace_value_uses(
+    &self,
+    file_path: &Path,
+    namespace_name: &str,
+  ) -> Result<Vec<Reference>> {
+    let file_data = self
+      .files
+      .get(file_path)
+      .ok_or_else(|| DominoError::FileNotFound(file_path.display().to_string()))?;
+    let semantic = file_data.semantic();
+    let Some(symbol_id) = semantic.scoping().get_root_binding(namespace_name) else {
+      return Ok(Vec::new());
+    };
+    let nodes = semantic.nodes();
+
+    let mut references = Vec::new();
+    for reference in semantic.symbol_references(symbol_id) {
+      let flags = reference.flags();
+      if flags.is_type() || flags.is_value_as_type() {
+        continue;
+      }
+      let node_id = reference.node_id();
+      let span = nodes.get_node(node_id).kind().span();
+      let is_member_access_or_type = match nodes.parent_kind(node_id) {
+        AstKind::StaticMemberExpression(member_expr) => member_expr.object.span() == span,
+        AstKind::VariableDeclarator(declarator) => {
+          declarator
+            .init
+            .as_ref()
+            .is_some_and(|init| init.span() == span)
+            && Self::destructured_members(declarator).is_some()
+        }
+        AstKind::JSXMemberExpression(_) | AstKind::TSQualifiedName(_) | AstKind::TSTypeQuery(_) => {
+          true
+        }
+        _ => false,
+      };
+      if is_member_access_or_type {
+        continue;
+      }
+      let (line, column) = self.span_to_line_col(file_data.source(), span);
+      references.push(Reference {
+        file_path: file_path.to_path_buf(),
+        line,
+        column,
+      });
     }
 
     Ok(references)
@@ -2885,5 +3013,101 @@ export function run() {
     assert!(analyzer
       .binding_importers_of(Path::new("app/src/named.ts"))
       .is_empty());
+  }
+
+  #[test]
+  fn test_find_namespace_value_uses() {
+    let source = r#"import * as ns from "./activities";
+import type * as types from "./activities";
+
+ns.member();
+ns?.optional();
+register(ns);
+const config = { activities: ns, ...ns };
+const list = [ns];
+const picked = ns["member"];
+type Shape = typeof ns;
+type Member = ns.Member;
+type Other = typeof types;
+const element = <ns.Component />;
+function shadowed(ns: object) {
+  return ns;
+}
+export { ns };
+const { member, other: renamed } = ns;
+const { ...rest } = ns;
+"#;
+    let profiler = Arc::new(Profiler::new(false));
+    let mut analyzer =
+      WorkspaceAnalyzer::new(vec![], Path::new("."), profiler).expect("Failed to create analyzer");
+    let file_path = Path::new("worker.tsx");
+    let file_data = WorkspaceAnalyzer::parse_source(file_path, source.to_string()).unwrap();
+    analyzer.files.insert(file_path.to_path_buf(), file_data);
+
+    let lines = |name: &str| -> Vec<usize> {
+      analyzer
+        .find_namespace_value_uses(file_path, name)
+        .unwrap()
+        .iter()
+        .map(|reference| reference.line)
+        .collect()
+    };
+
+    assert_eq!(
+      lines("ns"),
+      vec![6, 7, 7, 8, 9, 17, 19],
+      "argument, property value, spread, array element, computed member, re-export and \
+       rest destructuring are value uses; static and JSX member accesses, destructuring \
+       of named members, type positions and a shadowing parameter are not"
+    );
+    assert!(
+      lines("types").is_empty(),
+      "a type-only namespace import has no value use"
+    );
+    assert!(lines("missing").is_empty());
+
+    let refs = analyzer
+      .find_namespace_member_access(file_path, "ns", "Component")
+      .unwrap();
+    assert_eq!(refs.len(), 1, "`<ns.Component />` accesses one member");
+    let refs = analyzer
+      .find_namespace_member_access(file_path, "ns", "other")
+      .unwrap();
+    assert_eq!(
+      refs.iter().map(|r| r.line).collect::<Vec<_>>(),
+      vec![18],
+      "`const {{ other: renamed }} = ns` reads `ns.other`"
+    );
+  }
+
+  #[test]
+  fn test_extract_namespace_reexport() {
+    let source = r#"export * as jobs from "./jobs";
+export * from "./all";
+export type * as types from "./types";
+"#;
+    let allocator = Allocator::default();
+    let parse_result = Parser::new(&allocator, source, SourceType::ts()).parse();
+    let exports = WorkspaceAnalyzer::extract_exports(&parse_result.program);
+
+    let summary: Vec<_> = exports
+      .iter()
+      .map(|export| {
+        (
+          export.exported_name.as_str(),
+          export.is_namespace_reexport(),
+          export.is_type_only,
+        )
+      })
+      .collect();
+    assert_eq!(
+      summary,
+      vec![
+        ("jobs", true, false),
+        ("*", false, false),
+        ("types", true, true)
+      ],
+      "`export * as jobs` exports one binding, the namespace object"
+    );
   }
 }
