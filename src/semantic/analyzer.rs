@@ -847,6 +847,26 @@ impl WorkspaceAnalyzer {
             });
           }
         }
+        // `export enum` and `export namespace` declare runtime objects too;
+        // ambient (`declare`) ones are erased.
+        oxc_ast::ast::Declaration::TSEnumDeclaration(enum_decl) if !enum_decl.declare => {
+          exports.push(Export {
+            exported_name: enum_decl.id.name.to_string(),
+            local_name: None,
+            re_export_from: None,
+            is_type_only: false,
+          });
+        }
+        oxc_ast::ast::Declaration::TSModuleDeclaration(module_decl) if !module_decl.declare => {
+          if let oxc_ast::ast::TSModuleDeclarationName::Identifier(id) = &module_decl.id {
+            exports.push(Export {
+              exported_name: id.name.to_string(),
+              local_name: None,
+              re_export_from: None,
+              is_type_only: false,
+            });
+          }
+        }
         _ => {}
       }
     }
@@ -1130,8 +1150,23 @@ impl WorkspaceAnalyzer {
       oxc_ast::ast::Declaration::TSEnumDeclaration(enum_decl) => {
         Some(enum_decl.id.name.to_string())
       }
+      oxc_ast::ast::Declaration::TSModuleDeclaration(module_decl) => match &module_decl.id {
+        oxc_ast::ast::TSModuleDeclarationName::Identifier(id) => Some(id.name.to_string()),
+        oxc_ast::ast::TSModuleDeclarationName::StringLiteral(_) => None,
+      },
       _ => None,
     }
+  }
+
+  /// Whether `file_path` declares `symbol_name` at its top level.
+  pub fn declares_top_level_symbol(&self, file_path: &Path, symbol_name: &str) -> bool {
+    self.files.get(file_path).is_some_and(|file_data| {
+      file_data
+        .semantic()
+        .scoping()
+        .get_root_binding(symbol_name)
+        .is_some()
+    })
   }
 
   /// Check if a symbol is exported from a file
@@ -1425,6 +1460,11 @@ impl WorkspaceAnalyzer {
         }
         AstKind::TSEnumDeclaration(enum_decl) if !found_export_wrapper => {
           top_level_name = Some(enum_decl.id.name.to_string());
+        }
+        AstKind::TSModuleDeclaration(module_decl) if !found_export_wrapper => {
+          if let oxc_ast::ast::TSModuleDeclarationName::Identifier(id) = &module_decl.id {
+            top_level_name = Some(id.name.to_string());
+          }
         }
         AstKind::VariableDeclarator(var_decl) if !found_export_wrapper => {
           // For const/let declarations, get the binding name

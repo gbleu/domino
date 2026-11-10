@@ -9189,3 +9189,59 @@ fn test_private_symbol_change_does_not_reach_namespace_of_wildcard_barrel() {
     "`export *` does not expose a private symbol, so the barrel's namespace users are not affected"
   );
 }
+
+#[test]
+fn test_namespace_value_use_reaches_changed_enum_and_namespace() {
+  let module = |red: &str, root: &str| {
+    format!(
+      "export enum Color {{\n  Red = \"{red}\",\n}}\n\nexport namespace Paths {{\n  export const root = \"{root}\";\n}}\n\nexport function notify() {{\n  return 1;\n}}\n"
+    )
+  };
+  let base_module = module("red", "/");
+  let base = [
+    ("constants.ts", base_module.as_str()),
+    (
+      "all.spec.ts",
+      "import * as constants from \"./constants\";\n\nexport const all = { ...constants };\n",
+    ),
+    (
+      "member.spec.ts",
+      "import * as constants from \"./constants\";\n\nexport const run = () => constants.notify();\n",
+    ),
+  ];
+
+  for (changed, head) in [
+    ("enum", module("crimson", "/")),
+    ("namespace", module("red", "/app")),
+  ] {
+    let via_files = side_effect_via_files(&base, &[("constants.ts", Some(head.as_str()))]);
+    assert_eq!(
+      via_files,
+      paths(&["all.spec.ts"]),
+      "a changed exported {changed} is read by a value use of the namespace, not by `ns.notify()`"
+    );
+  }
+}
+
+#[test]
+fn test_namespace_value_use_reaches_removed_export() {
+  let base = namespace_base(&[
+    (
+      "all.spec.ts",
+      "import * as activities from \"./activities\";\n\nexport const all = { ...activities };\n",
+    ),
+    (
+      "member.spec.ts",
+      "import * as activities from \"./activities\";\n\nexport const run = () => activities.runChecks();\n",
+    ),
+  ]);
+  let head = ACTIVITIES.replace("\nexport async function notify() {\n  return 1;\n}\n", "");
+  assert_ne!(head, ACTIVITIES, "the fixture must contain `notify`");
+
+  let via_files = side_effect_via_files(&base, &[("activities.ts", Some(head.as_str()))]);
+  assert_eq!(
+    via_files,
+    paths(&["all.spec.ts"]),
+    "removing an export breaks a value use of the namespace, not `ns.runChecks()`"
+  );
+}

@@ -1,3 +1,4 @@
+fix(semantic): trace namespace value uses for enums, namespaces and removed exports | not submitted
 fix(semantic): keep export visibility through wildcard re-exports | not submitted
 fix(semantic): treat a namespace import used as a value as using every export | not submitted
 refactor(semantic): check deleted and replaced lines in one pass | not submitted

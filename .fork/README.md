@@ -32,6 +32,7 @@ exempt: they land by force-push, and their commits against `main` are upstream's
 
 | Patch | Upstream PR | State |
 | --- | --- | --- |
+| `fix(semantic): trace namespace value uses for enums, namespaces and removed exports` | not submitted | worth sending with the namespace value-use patch |
 | `fix(semantic): keep export visibility through wildcard re-exports` | not submitted | worth sending with the namespace value-use patch |
 | `fix(semantic): treat a namespace import used as a value as using every export` | not submitted | worth sending; upstream still drops namespace value uses and reads `export * as ns` as `export *` at `v2.2.1` |
 | `refactor(semantic): check deleted and replaced lines in one pass` | not submitted | worth sending with the replacement-hunk patch |
