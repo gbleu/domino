@@ -8893,3 +8893,275 @@ fn test_replaced_declaration_keeps_named_import_precision() {
     "replacing a declaration removes no side effect, so only its own dependents are affected"
   );
 }
+
+// ---------------------------------------------------------------------------
+// Namespace imports used as values
+// ---------------------------------------------------------------------------
+
+const ACTIVITIES: &str = r#"import { validate } from "./validation";
+
+const unusedRetries = 3;
+
+export async function runChecks() {
+  return validate();
+}
+
+export async function notify() {
+  return 1;
+}
+"#;
+
+const VALIDATION: &str = "export function validate() {\n  return true;\n}\n";
+
+/// The base files of a namespace value-use scenario: `activities.ts` exports
+/// `runChecks`, which uses `validate`, changed by [`change_validation`].
+fn namespace_base<'a>(files: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+  let mut base = vec![("activities.ts", ACTIVITIES), ("validation.ts", VALIDATION)];
+  base.extend_from_slice(files);
+  base
+}
+
+fn change_validation() -> Vec<(&'static str, Option<&'static str>)> {
+  vec![(
+    "validation.ts",
+    Some("export function validate() {\n  return false;\n}\n"),
+  )]
+}
+
+/// A spec hands the activities namespace to a runner, as a property value, in
+/// test code: the runner may call any activity, the affected one included.
+#[test]
+fn test_namespace_passed_as_object_property_value_reaches_spec() {
+  let via_files = side_effect_via_files(
+    &namespace_base(&[
+      (
+        "testing.ts",
+        "export async function startRunner(options: object) {\n  return options;\n}\n",
+      ),
+      (
+        "runner.spec.ts",
+        r#"import * as importedActivities from "./activities";
+import { startRunner } from "./testing";
+
+describe("runner", () => {
+  it("runs", async () => {
+    await startRunner({ name: "runner", activities: importedActivities });
+  });
+});
+"#,
+      ),
+      (
+        "shorthand.spec.ts",
+        r#"import * as activities from "./activities";
+import { startRunner } from "./testing";
+
+it("runs", async () => {
+  await startRunner({ activities });
+});
+"#,
+      ),
+    ]),
+    &change_validation(),
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&["activities.ts", "runner.spec.ts", "shorthand.spec.ts"]),
+    "a namespace object used as a property value references every export of its module"
+  );
+}
+
+/// Passing the namespace as an argument, spreading it, putting it in an array or
+/// reading a computed member all hand the namespace object over: each is a
+/// reference to every export, and the enclosing symbol is affected.
+#[test]
+fn test_namespace_used_as_value_affects_enclosing_symbol() {
+  let via_files = side_effect_via_files(
+    &namespace_base(&[
+      (
+        "argument.ts",
+        "import * as activities from \"./activities\";\n\nexport function start(register: (a: object) => void) {\n  register(activities);\n}\n",
+      ),
+      (
+        "argument.spec.ts",
+        "import { start } from \"./argument\";\n\nexport const started = start;\n",
+      ),
+      (
+        "spread.ts",
+        "import * as activities from \"./activities\";\n\nexport const all = { ...activities };\n",
+      ),
+      (
+        "array.ts",
+        "import * as activities from \"./activities\";\n\nexport const modules = [activities];\n",
+      ),
+      (
+        "computed.ts",
+        "import * as activities from \"./activities\";\n\nexport const pick = (name: string) => (activities as Record<string, unknown>)[name];\n",
+      ),
+    ]),
+    &change_validation(),
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&[
+      "activities.ts",
+      "argument.spec.ts",
+      "argument.ts",
+      "array.ts",
+      "computed.ts",
+      "spread.ts",
+    ]),
+    "an argument, a spread, an array element and a computed member access each use the \
+     namespace as a value; the use propagates through the enclosing symbol"
+  );
+}
+
+/// A namespace used by top-level code outside every symbol changes what loading
+/// the module does: its importers are affected whatever they import.
+#[test]
+fn test_namespace_used_in_top_level_code_is_a_side_effect_change() {
+  let via_files = side_effect_via_files(
+    &namespace_base(&[
+      (
+        "registry.ts",
+        "import * as activities from \"./activities\";\n\nconst registered: object[] = [];\nregistered.push(activities);\n\nexport const name = \"registry\";\n",
+      ),
+      (
+        "registry.spec.ts",
+        "import { name } from \"./registry\";\n\nexport const label = name;\n",
+      ),
+    ]),
+    &change_validation(),
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&["activities.ts", "registry.spec.ts", "registry.ts"]),
+    "top-level use of the namespace is a side-effect change of the module"
+  );
+}
+
+/// Re-exporting the namespace (`export { ns }`, `export * as ns from`) hands it to
+/// the importers of the re-exporting module, which use it as they would a
+/// namespace import.
+#[test]
+fn test_reexported_namespace_reaches_its_importers() {
+  let via_files = side_effect_via_files(
+    &namespace_base(&[
+      (
+        "forward.ts",
+        "import * as activities from \"./activities\";\n\nexport { activities };\n",
+      ),
+      (
+        "forward.spec.ts",
+        "import { activities } from \"./forward\";\n\nexport const run = () => activities.runChecks();\n",
+      ),
+      ("barrel.ts", "export * as jobs from \"./activities\";\n"),
+      (
+        "barrel.spec.ts",
+        "import { jobs } from \"./barrel\";\n\nexport const run = () => jobs.runChecks();\n",
+      ),
+      (
+        "other-member.spec.ts",
+        "import { jobs } from \"./barrel\";\n\nexport const run = () => jobs.notify();\n",
+      ),
+      (
+        "value.spec.ts",
+        "import { jobs } from \"./barrel\";\n\nexport const all = { ...jobs };\n",
+      ),
+      (
+        "outer.spec.ts",
+        "import * as lib from \"./barrel\";\n\nexport const run = () => lib.jobs.runChecks();\n",
+      ),
+      (
+        "unrelated.spec.ts",
+        "import { runChecks } from \"./barrel\";\n\nexport const run = runChecks;\n",
+      ),
+    ]),
+    &change_validation(),
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&[
+      "activities.ts",
+      "barrel.spec.ts",
+      "forward.spec.ts",
+      "forward.ts",
+      "outer.spec.ts",
+      "value.spec.ts",
+    ]),
+    "a re-exported namespace keeps namespace semantics in its importers (member access \
+     of the affected export, or a value use); `export * as jobs` exports `jobs`, not the \
+     members of the module"
+  );
+}
+
+/// Static member accesses keep their precision, type positions are erased, and a
+/// change to a symbol the module does not export cannot be read through its
+/// namespace.
+#[test]
+fn test_namespace_member_access_and_type_uses_stay_precise() {
+  let base = namespace_base(&[
+    (
+      "member.spec.ts",
+      "import * as activities from \"./activities\";\n\nexport const run = () => activities.notify();\n",
+    ),
+    (
+      "types.spec.ts",
+      "import * as activities from \"./activities\";\n\ntype Activities = typeof activities;\nexport const options: Partial<Activities> = {};\n",
+    ),
+    (
+      "type-import.spec.ts",
+      "import type * as activities from \"./activities\";\n\nexport type Activities = typeof activities;\n",
+    ),
+    (
+      "destructure.spec.ts",
+      "import * as activities from \"./activities\";\n\nconst { notify } = activities;\nexport const run = notify;\n",
+    ),
+  ]);
+
+  let via_files = side_effect_via_files(&base, &change_validation());
+  assert_eq!(
+    via_files,
+    paths(&["activities.ts"]),
+    "`ns.unchanged`, `const {{ unchanged }} = ns` and `typeof ns` do not reference the \
+     affected export"
+  );
+
+  let via_files = side_effect_via_files(
+    &base,
+    &[(
+      "activities.ts",
+      Some(&ACTIVITIES.replace("unusedRetries = 3", "unusedRetries = 4")),
+    )],
+  );
+  assert_eq!(
+    via_files,
+    Vec::<PathBuf>::new(),
+    "a change to a symbol the module does not export is not read through its namespace"
+  );
+}
+
+#[test]
+fn test_namespace_spread_and_destructured_member_reach_spec() {
+  let base = namespace_base(&[
+    (
+      "value.spec.ts",
+      "import * as activities from \"./activities\";\n\nexport const all = { ...activities };\n",
+    ),
+    (
+      "destructure-hit.spec.ts",
+      "import * as activities from \"./activities\";\n\nexport function run() {\n  const { runChecks } = activities;\n  return runChecks();\n}\n",
+    ),
+  ]);
+
+  let via_files = side_effect_via_files(&base, &change_validation());
+  assert_eq!(
+    via_files,
+    paths(&["activities.ts", "destructure-hit.spec.ts", "value.spec.ts"]),
+    "spreading the namespace hands over every export, and destructuring the affected \
+     export reads it"
+  );
+}

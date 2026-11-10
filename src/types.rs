@@ -206,6 +206,17 @@ pub struct Export {
   pub is_type_only: bool,
 }
 
+impl Export {
+  /// `local_name` of a namespace re-export (`export * as ns from "m"`), which
+  /// exports the namespace object of `m` under `exported_name`.
+  pub const NAMESPACE: &'static str = "*";
+
+  /// Whether this is a namespace re-export (`export * as ns from "m"`).
+  pub fn is_namespace_reexport(&self) -> bool {
+    self.re_export_from.is_some() && self.local_name.as_deref() == Some(Self::NAMESPACE)
+  }
+}
+
 /// Configuration for the true affected algorithm
 #[derive(Debug, Clone)]
 pub struct TrueAffectedConfig {

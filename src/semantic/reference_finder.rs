@@ -72,15 +72,29 @@ impl<'a> ReferenceFinder<'a> {
     let mut all_refs = Vec::new();
     let mut visited = FxHashSet::default();
 
-    self.find_refs_recursive(symbol_name, declaring_file, &mut all_refs, &mut visited)?;
+    // A symbol the file does not export cannot be read through its namespace
+    // object; a symbol reached through an import or a re-export is exported.
+    let is_exported = self
+      .analyzer
+      .is_symbol_exported(declaring_file, symbol_name);
+    self.find_refs_recursive(
+      symbol_name,
+      declaring_file,
+      is_exported,
+      &mut all_refs,
+      &mut visited,
+    )?;
 
     Ok(all_refs)
   }
 
+  /// `is_exported`: whether `current_file` exports `symbol_name`, so that it can
+  /// be read through the namespace object of `current_file`.
   fn find_refs_recursive(
     &self,
     symbol_name: &str,
     current_file: &Path,
+    is_exported: bool,
     all_refs: &mut Vec<Reference>,
     visited: &mut FxHashSet<(PathBuf, String)>,
   ) -> Result<()> {
@@ -125,7 +139,7 @@ impl<'a> ReferenceFinder<'a> {
             local_name, importing_file
           );
           // Recursively find references to the re-export
-          self.find_refs_recursive(local_name, importing_file, all_refs, visited)?;
+          self.find_refs_recursive(local_name, importing_file, true, all_refs, visited)?;
         } else {
           // Symbol is used but not re-exported
           // The references found via find_local_references above are sufficient
@@ -202,33 +216,15 @@ impl<'a> ReferenceFinder<'a> {
         }
 
         // For static namespace imports, we need to find references to namespace.symbol
-        // specifically (e.g., utils.formatDate, not just any reference to utils)
-        match self
-          .analyzer
-          .find_namespace_member_access(importing_file, local_name, symbol_name)
-        {
-          Ok(member_refs) => {
-            if !member_refs.is_empty() {
-              // Found actual references to namespace.symbol - these files are definitely affected
-              debug!(
-                "Found {} references to {}.{} in {:?}",
-                member_refs.len(),
-                local_name,
-                symbol_name,
-                importing_file
-              );
-              all_refs.extend(member_refs);
-            }
-            // If we don't find any references to 'namespace.symbol', we don't mark
-            // the file as affected (strict behavior) since the namespace either
-            // doesn't use this specific symbol or is dead code.
-          }
-          Err(e) => {
-            // Propagate the error instead of silently marking as affected
-            // This ensures bugs in reference finding don't hide real issues
-            return Err(e);
-          }
-        }
+        // specifically (e.g., utils.formatDate, not just any reference to utils), and
+        // to the namespace object itself used as a value.
+        self.trace_namespace_binding(
+          symbol_name,
+          is_exported,
+          importing_file,
+          local_name,
+          all_refs,
+        )?;
       }
     }
 
@@ -242,6 +238,12 @@ impl<'a> ReferenceFinder<'a> {
           continue;
         }
 
+        // `export * as ns from "m"` exports the namespace of `m`, not a symbol
+        // named `ns` of it: nothing to follow.
+        if export.is_namespace_reexport() {
+          continue;
+        }
+
         // If this is a re-export from elsewhere, follow it
         if let Some(ref from_module) = export.re_export_from {
           if let Some(resolved) = self.resolve_import(current_file, from_module) {
@@ -249,7 +251,7 @@ impl<'a> ReferenceFinder<'a> {
               "Following re-export of '{}' from {:?} to {:?}",
               symbol_name, current_file, resolved
             );
-            self.find_refs_recursive(symbol_name, &resolved, all_refs, visited)?;
+            self.find_refs_recursive(symbol_name, &resolved, true, all_refs, visited)?;
           }
         }
       }
@@ -288,7 +290,23 @@ impl<'a> ReferenceFinder<'a> {
         );
         // Recursively look for imports of the re-exporting file
         // The symbol name stays the same through wildcard re-exports
-        self.find_refs_recursive(symbol_name, reexporting_file, all_refs, visited)?;
+        self.find_refs_recursive(symbol_name, reexporting_file, true, all_refs, visited)?;
+      } else if export.is_namespace_reexport() {
+        // `export * as ns from "<current_file>"`: the namespace object is exported
+        // as `ns`.
+        if is_exported {
+          debug!(
+            "Found {:?} re-exporting the namespace of {:?} as '{}'",
+            reexporting_file, current_file, export.exported_name
+          );
+          self.find_namespace_alias_refs(
+            symbol_name,
+            reexporting_file,
+            &export.exported_name,
+            all_refs,
+            visited,
+          )?;
+        }
       } else {
         // Named re-export: export { X } from '...' or export { X as Y } from '...'
         let exported_symbol = export
@@ -301,9 +319,163 @@ impl<'a> ReferenceFinder<'a> {
             reexporting_file, export.exported_name, current_file
           );
           // Recursively look for imports of the re-exporting file
-          self.find_refs_recursive(&export.exported_name, reexporting_file, all_refs, visited)?;
+          self.find_refs_recursive(
+            &export.exported_name,
+            reexporting_file,
+            true,
+            all_refs,
+            visited,
+          )?;
         }
       }
+    }
+
+    Ok(())
+  }
+
+  /// Trace `symbol_name`, an export of some module, through `local_name`, a
+  /// binding of `importing_file` holding the namespace object of that module
+  /// (`import * as ns from "m"`, or `import { ns }` of a re-exported namespace).
+  ///
+  /// `ns.symbol` references the symbol precisely. When `is_exported` (the symbol
+  /// can be read through the namespace object), any use of the namespace as a
+  /// value in its own right (`register(ns)`, `{ activities: ns }`) references it
+  /// too, see [`WorkspaceAnalyzer::find_namespace_value_uses`].
+  fn trace_namespace_binding(
+    &self,
+    symbol_name: &str,
+    is_exported: bool,
+    importing_file: &Path,
+    local_name: &str,
+    all_refs: &mut Vec<Reference>,
+  ) -> Result<()> {
+    // If no `ns.symbol` is found, the file is not affected through this access
+    // (strict behavior): the namespace doesn't use this symbol or is dead code.
+    let member_refs =
+      self
+        .analyzer
+        .find_namespace_member_access(importing_file, local_name, symbol_name)?;
+    if !member_refs.is_empty() {
+      debug!(
+        "Found {} references to {}.{} in {:?}",
+        member_refs.len(),
+        local_name,
+        symbol_name,
+        importing_file
+      );
+      all_refs.extend(member_refs);
+    }
+
+    if is_exported {
+      self.push_namespace_value_uses(importing_file, local_name, all_refs)?;
+    }
+
+    Ok(())
+  }
+
+  /// Trace `symbol_name` through `alias`, an export of `file` that is the
+  /// namespace object of the module exporting the symbol (`export * as alias from
+  /// "m"`). Its importers get namespace semantics (see
+  /// [`ReferenceFinder::trace_namespace_binding`]), and re-exports of `alias` are
+  /// followed.
+  fn find_namespace_alias_refs(
+    &self,
+    symbol_name: &str,
+    file: &Path,
+    alias: &str,
+    all_refs: &mut Vec<Reference>,
+    visited: &mut FxHashSet<(PathBuf, String)>,
+  ) -> Result<()> {
+    // Not a valid identifier pair, so it cannot collide with a traced symbol
+    let key = (file.to_path_buf(), format!("{alias}.{symbol_name}"));
+    if !visited.insert(key) {
+      return Ok(());
+    }
+
+    // `import { alias } from "<file>"`: `alias` holds the namespace object.
+    let alias_key = (file.to_path_buf(), alias.to_string());
+    for (importing_file, local_name, _, is_dynamic) in self
+      .analyzer
+      .import_index
+      .get(&alias_key)
+      .into_iter()
+      .flatten()
+    {
+      if !is_dynamic {
+        self.trace_namespace_binding(symbol_name, true, importing_file, local_name, all_refs)?;
+      }
+    }
+
+    // `import * as outer from "<file>"`: `outer.alias` reads the namespace object,
+    // and `outer` used as a value hands it over too.
+    let namespace_key = (file.to_path_buf(), "*".to_string());
+    for (importing_file, local_name, _, is_dynamic) in self
+      .analyzer
+      .import_index
+      .get(&namespace_key)
+      .into_iter()
+      .flatten()
+    {
+      if !is_dynamic {
+        self.trace_namespace_binding(alias, true, importing_file, local_name, all_refs)?;
+      }
+    }
+
+    let reexporters = self
+      .analyzer
+      .reexport_index
+      .get(Self::normalize_path(&self.cwd, file));
+    for (reexporting_file, export) in reexporters.into_iter().flatten() {
+      if export.exported_name == "*" {
+        self.find_namespace_alias_refs(symbol_name, reexporting_file, alias, all_refs, visited)?;
+      } else if export.is_namespace_reexport() {
+        // `export * as outer from "<file>"`: `outer.alias` is the namespace object
+        self.find_namespace_alias_refs(
+          alias,
+          reexporting_file,
+          &export.exported_name,
+          all_refs,
+          visited,
+        )?;
+      } else if export
+        .local_name
+        .as_deref()
+        .unwrap_or(&export.exported_name)
+        == alias
+      {
+        self.find_namespace_alias_refs(
+          symbol_name,
+          reexporting_file,
+          &export.exported_name,
+          all_refs,
+          visited,
+        )?;
+      }
+    }
+
+    Ok(())
+  }
+
+  /// Report the uses of the namespace binding `local_name` of `importing_file` as
+  /// a value in its own right (see [`WorkspaceAnalyzer::find_namespace_value_uses`]).
+  /// Each is a reference to every export of the module.
+  fn push_namespace_value_uses(
+    &self,
+    importing_file: &Path,
+    local_name: &str,
+    all_refs: &mut Vec<Reference>,
+  ) -> Result<()> {
+    let value_uses = self
+      .analyzer
+      .find_namespace_value_uses(importing_file, local_name)?;
+    if !value_uses.is_empty() {
+      debug!(
+        "Namespace '{}' is used as a value {} time(s) in {:?}",
+        local_name,
+        value_uses.len(),
+        importing_file
+      );
+      all_refs.extend(value_uses);
     }
 
     Ok(())
