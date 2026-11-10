@@ -9245,3 +9245,34 @@ fn test_namespace_value_use_reaches_removed_export() {
     "removing an export breaks a value use of the namespace, not `ns.runChecks()`"
   );
 }
+
+#[test]
+fn test_default_export_change_does_not_reach_namespace_of_wildcard_barrel() {
+  // `export default function main` traces `default`; `export function main` plus
+  // `export default main` traces `main`, which `export *` forwards by name.
+  let module = |value: u32, also_named: bool| {
+    let main = if also_named {
+      format!("export function main() {{\n  return {value};\n}}\n\nexport default main;\n")
+    } else {
+      format!("export default function main() {{\n  return {value};\n}}\n")
+    };
+    format!("{main}\nexport function helper() {{\n  return 0;\n}}\n")
+  };
+  for (also_named, expected) in [(false, vec![]), (true, paths(&["all.spec.ts"]))] {
+    let base_module = module(1, also_named);
+    let base = [
+      ("acts.ts", base_module.as_str()),
+      ("barrel.ts", "export * from \"./acts\";\n"),
+      (
+        "all.spec.ts",
+        "import * as jobs from \"./barrel\";\n\nexport const all = { ...jobs };\n",
+      ),
+    ];
+    let head = module(2, also_named);
+    let via_files = side_effect_via_files(&base, &[("acts.ts", Some(head.as_str()))]);
+    assert_eq!(
+      via_files, expected,
+      "`export *` never forwards `default`, but forwards the same function exported by name (also_named: {also_named})"
+    );
+  }
+}
