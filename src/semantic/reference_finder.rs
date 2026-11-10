@@ -158,24 +158,34 @@ impl<'a> ReferenceFinder<'a> {
       }
     }
 
+    // Is the symbol being propagated the module's default export? A default
+    // export is recorded either under the name "default" (anonymous default,
+    // container-symbol resolution) or under its local identifier with
+    // exported_name == "default" (`export default Page`). Evaluated lazily: this
+    // runs for every visited node.
+    let exports = self.analyzer.exports.get(current_file);
+    let is_default_export_symbol = || {
+      symbol_name == "default"
+        || exports.is_some_and(|exports| {
+          exports
+            .iter()
+            .any(|e| e.exported_name == "default" && e.local_name.as_deref() == Some(symbol_name))
+        })
+    };
+    // Whether the symbol is also exported under a name other than `default`.
+    let exported_by_name = || {
+      exports.is_some_and(|exports| {
+        exports.iter().any(|e| {
+          e.exported_name != "default"
+            && (e.exported_name == symbol_name || e.local_name.as_deref() == Some(symbol_name))
+        })
+      })
+    };
+
     // Also check for namespace imports (import * as foo)
     let namespace_key = (current_file.to_path_buf(), "*".to_string());
     if let Some(importers) = self.analyzer.import_index.get(&namespace_key) {
-      // Is the symbol being propagated the module's default export? A default
-      // export is recorded either under the name "default" (anonymous default,
-      // container-symbol resolution) or under its local identifier with
-      // exported_name == "default" (`export default Page`).
-      let is_default_export_symbol = symbol_name == "default"
-        || self
-          .analyzer
-          .exports
-          .get(current_file)
-          .is_some_and(|exports| {
-            exports
-              .iter()
-              .any(|e| e.exported_name == "default" && e.local_name.as_deref() == Some(symbol_name))
-          });
-
+      let is_default_export_symbol = is_default_export_symbol();
       for (importing_file, local_name, _from_module, is_dynamic) in importers {
         debug!(
           "Found {} namespace import in {:?} as '{}' (checking for {}.{})",
@@ -295,11 +305,12 @@ impl<'a> ReferenceFinder<'a> {
         );
         // Recursively look for imports of the re-exporting file
         // The symbol name stays the same through wildcard re-exports, and so does
-        // its visibility: `export *` only passes on what `current_file` exports.
+        // its visibility: `export *` only passes on what `current_file` exports,
+        // never its default export.
         self.find_refs_recursive(
           symbol_name,
           reexporting_file,
-          is_exported,
+          is_exported && (!is_default_export_symbol() || exported_by_name()),
           all_refs,
           visited,
         )?;
