@@ -9165,3 +9165,27 @@ fn test_namespace_spread_and_destructured_member_reach_spec() {
      export reads it"
   );
 }
+
+#[test]
+fn test_private_symbol_change_does_not_reach_namespace_of_wildcard_barrel() {
+  let base = namespace_base(&[
+    ("barrel.ts", "export * from \"./activities\";\n"),
+    (
+      "worker.spec.ts",
+      "import * as jobs from \"./barrel\";\n\nexport const all = { ...jobs };\n",
+    ),
+  ]);
+
+  let via_files = side_effect_via_files(
+    &base,
+    &[(
+      "activities.ts",
+      Some(&ACTIVITIES.replace("unusedRetries = 3", "unusedRetries = 4")),
+    )],
+  );
+  assert_eq!(
+    via_files,
+    Vec::<PathBuf>::new(),
+    "`export *` does not expose a private symbol, so the barrel's namespace users are not affected"
+  );
+}
