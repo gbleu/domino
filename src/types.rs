@@ -265,6 +265,20 @@ pub struct AffectedReport {
   pub run_started_at_unix_secs: i64,
 }
 
+impl AffectedReport {
+  /// The report of a run with nothing to analyze (an empty diff, no projects),
+  /// so a requested report file is still written.
+  pub fn empty(run_started_at_unix_secs: i64) -> Self {
+    Self {
+      projects: vec![],
+      global_triggers: vec![],
+      totals: ReportTotals::default(),
+      version: env!("CARGO_PKG_VERSION"),
+      run_started_at_unix_secs,
+    }
+  }
+}
+
 /// A changed file that matched a `{workspaceRoot}/...` pattern in nx.json's
 /// `namedInputs`, triggering global invalidation.
 #[derive(Debug, Clone, Serialize)]

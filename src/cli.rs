@@ -1,13 +1,22 @@
 use crate::core;
 use crate::error::Result;
 use crate::profiler::Profiler;
-use crate::types::{LockfileStrategy, RootTsconfigStrategy, TrueAffectedConfig};
+use crate::types::{AffectedReport, LockfileStrategy, RootTsconfigStrategy, TrueAffectedConfig};
 use crate::workspace;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use colored::Colorize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::debug;
+
+/// Format of the file written by `--report`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ReportFormat {
+  /// Interactive HTML report with a dependency graph
+  Html,
+  /// The report data as JSON
+  Json,
+}
 
 #[derive(Parser)]
 #[command(name = "domino")]
@@ -42,17 +51,22 @@ enum Commands {
     #[arg(long)]
     json: bool,
 
-    /// Show all projects regardless of changes
-    #[arg(long)]
+    /// Show all projects regardless of changes (no analysis, so no --report)
+    #[arg(long, conflicts_with = "report")]
     all: bool,
 
     /// Enable performance profiling (also: DOMINO_PROFILE=1)
     #[arg(long)]
     profile: bool,
 
-    /// Generate HTML dependency graph report
+    /// Generate a report of why each project is affected (see --report-format)
     #[arg(long)]
     report: Option<PathBuf>,
+
+    /// Format of the --report file: html (interactive dependency graph) or json
+    /// (the report data the HTML embeds as #domino-meta)
+    #[arg(long, value_enum, default_value_t = ReportFormat::Html, requires = "report")]
+    report_format: ReportFormat,
 
     /// Head commit to compare (defaults to working tree)
     #[arg(long)]
@@ -101,6 +115,7 @@ pub fn run() -> Result<()> {
       all,
       profile,
       report,
+      report_format,
       lockfile_strategy,
       root_tsconfig_strategy,
     } => {
@@ -132,6 +147,14 @@ pub fn run() -> Result<()> {
       if projects.is_empty() {
         if !json {
           eprintln!("{}", "No projects found in workspace".red());
+        }
+        if let Some(report_path) = &report {
+          write_report(
+            &AffectedReport::empty(unix_now()),
+            report_path,
+            report_format,
+            json,
+          )?;
         }
         return Ok(());
       }
@@ -175,17 +198,10 @@ pub fn run() -> Result<()> {
         core::find_affected(config, profiler)?
       };
 
-      // Generate HTML report if requested
-      if let Some(report_path) = report {
+      // Generate the report if requested
+      if let Some(report_path) = &report {
         if let Some(report_data) = &result.report {
-          crate::report::generate_html_report(report_data, &report_path)?;
-          if !json {
-            eprintln!(
-              "{} {}",
-              "✓".green(),
-              format!("HTML report generated: {}", report_path.display()).bold()
-            );
-          }
+          write_report(report_data, report_path, report_format, json)?;
         } else if !json {
           eprintln!("{} {}", "⚠".yellow(), "No report data available".yellow());
         }
@@ -218,4 +234,38 @@ pub fn run() -> Result<()> {
       Ok(())
     }
   }
+}
+
+/// Write the `--report` file in the requested format.
+fn write_report(
+  report: &AffectedReport,
+  path: &Path,
+  format: ReportFormat,
+  json: bool,
+) -> Result<()> {
+  let kind = match format {
+    ReportFormat::Html => {
+      crate::report::generate_html_report(report, path)?;
+      "HTML"
+    }
+    ReportFormat::Json => {
+      crate::report::generate_json_report(report, path)?;
+      "JSON"
+    }
+  };
+  if !json {
+    eprintln!(
+      "{} {}",
+      "✓".green(),
+      format!("{kind} report generated: {}", path.display()).bold()
+    );
+  }
+  Ok(())
+}
+
+fn unix_now() -> i64 {
+  std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map(|d| d.as_secs() as i64)
+    .unwrap_or(0)
 }

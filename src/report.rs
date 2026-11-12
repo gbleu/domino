@@ -75,6 +75,14 @@ pub fn generate_html_report(report: &AffectedReport, output_path: &Path) -> Resu
   Ok(html)
 }
 
+/// Write the report data as JSON: the payload the HTML report embeds as
+/// `#domino-meta`, for consumers that would otherwise parse the HTML.
+pub fn generate_json_report(report: &AffectedReport, output_path: &Path) -> Result<()> {
+  let json = serde_json::to_string(report)?;
+  fs::write(output_path, json)?;
+  Ok(())
+}
+
 fn format_number(n: usize) -> String {
   let s = n.to_string();
   let mut result = String::new();

@@ -101,7 +101,7 @@ fn find_affected_internal(
     debug!("No changes detected");
     return Ok(AffectedResult {
       affected_projects: vec![],
-      report: None,
+      report: generate_report.then(|| AffectedReport::empty(run_started_at_unix_secs)),
     });
   }
 

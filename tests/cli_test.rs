@@ -190,6 +190,138 @@ export function unusedFn() {
   );
 }
 
+/// `--report-format json` writes the report data the HTML report embeds as
+/// `#domino-meta`, so consumers need not parse the HTML.
+#[test]
+fn test_report_format_json_matches_html_metadata() {
+  let branch = TestBranch::new("test-report-format-json");
+  branch.make_change(
+    "proj1/index.ts",
+    r#"export function proj1() {
+  return 'proj1-modified';
+}
+"#,
+  );
+  let dir = tempfile::tempdir().unwrap();
+  let html_path = dir.path().join("report.html");
+  let json_path = dir.path().join("report.json");
+
+  let output = branch.run_domino(&[
+    "affected",
+    "--base",
+    "main",
+    "--report",
+    html_path.to_str().unwrap(),
+  ]);
+  assert!(output.status.success(), "HTML report run should succeed");
+
+  let output = branch.run_domino(&[
+    "affected",
+    "--base",
+    "main",
+    "--report",
+    json_path.to_str().unwrap(),
+    "--report-format",
+    "json",
+  ]);
+  assert!(output.status.success(), "JSON report run should succeed");
+  assert!(
+    String::from_utf8_lossy(&output.stderr).contains("JSON report generated"),
+    "the JSON report is announced as such"
+  );
+
+  let html = fs::read_to_string(&html_path).unwrap();
+  let marker = r#"id="domino-meta">"#;
+  let start = html.find(marker).expect("HTML report embeds #domino-meta") + marker.len();
+  let end = start + html[start..].find("</script>").unwrap();
+  let mut from_html: serde_json::Value = serde_json::from_str(&html[start..end]).unwrap();
+  let mut from_json: serde_json::Value =
+    serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+
+  // Two runs: only their start times differ.
+  for report in [&mut from_html, &mut from_json] {
+    report
+      .as_object_mut()
+      .unwrap()
+      .remove("runStartedAtUnixSecs")
+      .expect("the report records its start time");
+  }
+  assert_eq!(from_json, from_html, "same data in both formats");
+  assert!(
+    from_json["projects"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .any(|project| project["name"] == "proj1"),
+    "the report lists the changed project"
+  );
+}
+
+/// `--report-format` only applies to `--report`: alone, it is rejected rather
+/// than silently ignored.
+#[test]
+fn test_report_format_requires_report() {
+  let output = Command::new(domino_binary())
+    .args(["affected", "--report-format", "json"])
+    .current_dir(fixture_path())
+    .output()
+    .expect("Failed to execute domino");
+
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert_eq!(output.status.code(), Some(2), "clap usage error");
+  assert!(
+    stderr.contains("required arguments were not provided") && stderr.contains("--report <REPORT>"),
+    "the error is the missing --report, not another usage error: {stderr}"
+  );
+}
+
+/// With nothing to analyze, a requested report is still written, so a CI job
+/// never reads a missing or stale file.
+#[test]
+fn test_report_written_on_empty_diff() {
+  let branch = TestBranch::new("test-report-empty-diff");
+  let dir = tempfile::tempdir().unwrap();
+  let json_path = dir.path().join("report.json");
+
+  let output = branch.run_domino(&[
+    "affected",
+    "--base",
+    "main",
+    "--json",
+    "--report",
+    json_path.to_str().unwrap(),
+    "--report-format",
+    "json",
+  ]);
+  assert!(output.status.success(), "empty diff run should succeed");
+
+  let report: serde_json::Value =
+    serde_json::from_str(&fs::read_to_string(&json_path).expect("report file written")).unwrap();
+  assert_eq!(
+    report["projects"],
+    serde_json::json!([]),
+    "no affected project"
+  );
+}
+
+/// `--all` lists projects without analyzing anything, so there is no report to
+/// write: combining it with `--report` is rejected.
+#[test]
+fn test_report_conflicts_with_all() {
+  let output = Command::new(domino_binary())
+    .args(["affected", "--all", "--report", "report.json"])
+    .current_dir(fixture_path())
+    .output()
+    .expect("Failed to execute domino");
+
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert_eq!(output.status.code(), Some(2), "clap usage error");
+  assert!(
+    stderr.contains("cannot be used with"),
+    "the error names the conflict: {stderr}"
+  );
+}
+
 /// `--cwd .` must trace imports exactly like the default (absolute) cwd. A
 /// relative cwd used to fail every `strip_prefix(cwd)` on the resolver's
 /// realpaths, leaving the import index empty so import-only dependents
