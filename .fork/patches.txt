@@ -1,3 +1,4 @@
+feat(cli): add --report-format to write the report as JSON | not submitted
 fix(semantic): do not forward default exports through wildcard re-exports | not submitted
 fix(semantic): trace namespace value uses for enums, namespaces and removed exports | not submitted
 fix(semantic): keep export visibility through wildcard re-exports | not submitted

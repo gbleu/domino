@@ -111,6 +111,9 @@ domino affected --debug
 
 # Generate a detailed report
 domino affected --report report.html
+
+# Write the report data as JSON
+domino affected --report report.json --report-format json
 ```
 
 ### Options
@@ -120,6 +123,7 @@ domino affected --report report.html
 - `--all`: Show all projects regardless of changes
 - `--json`: Output results as JSON
 - `--report <PATH>`: Generate a detailed analysis report
+- `--report-format <FORMAT>`: Format of the `--report` file: `html` (interactive dependency graph, default) or `json` (the report data, also embedded in the HTML as `#domino-meta`)
 - `--debug`: Enable debug logging
 - `--cwd <PATH>`: Set the current working directory
 - `--lockfile-strategy <STRATEGY>`: Lockfile change detection strategy (default: `direct`)

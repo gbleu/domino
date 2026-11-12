@@ -8,6 +8,9 @@ pub enum DominoError {
   #[error("Regex error: {0}")]
   Regex(#[from] regex::Error),
 
+  #[error("JSON error: {0}")]
+  Json(#[from] serde_json::Error),
+
   #[error("Parse error: {0}")]
   Parse(String),
 

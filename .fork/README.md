@@ -32,6 +32,7 @@ exempt: they land by force-push, and their commits against `main` are upstream's
 
 | Patch | Upstream PR | State |
 | --- | --- | --- |
+| `feat(cli): add --report-format to write the report as JSON` | not submitted | worth sending; upstream's `--report` writes HTML only |
 | `fix(semantic): do not forward default exports through wildcard re-exports` | not submitted | worth sending with the namespace value-use patch |
 | `fix(semantic): trace namespace value uses for enums, namespaces and removed exports` | not submitted | worth sending with the namespace value-use patch |
 | `fix(semantic): keep export visibility through wildcard re-exports` | not submitted | worth sending with the namespace value-use patch |

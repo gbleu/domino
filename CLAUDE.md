@@ -178,6 +178,9 @@ domino affected --profile
 # Generate an HTML dependency graph report
 domino affected --report ./affected-report.html
 
+# Write the report data as JSON instead (the payload the HTML embeds as #domino-meta)
+domino affected --report ./affected-report.json --report-format json
+
 # Lockfile change detection strategy: none | direct | full (default: direct)
 domino affected --lockfile-strategy full
 
