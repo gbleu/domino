@@ -5072,6 +5072,86 @@ export const obsolete = () => 2;
   );
 }
 
+/// The lib for the destructured-export tests: `index.ts` exports `widget` and
+/// `other` through one destructured declaration whose initializer references
+/// `part` from `part.ts`. `app` imports `widget`.
+fn scaffold_destructured_export_repo() -> (TempDir, PathBuf, TrueAffectedConfig) {
+  let (tmp, root, config) = scaffold_lib_app_repo(
+    r#"import { part } from './part';
+
+function createKit(parts: { part: () => number }) {
+  return { widget: () => parts.part(), other: () => 0 };
+}
+
+export const { widget, other } = createKit({
+  part,
+});
+"#,
+  );
+  fs::write(
+    root.join("libs/lib/src/part.ts"),
+    "export const part = () => 1;\n",
+  )
+  .unwrap();
+  git_in(&root, &["add", "."]);
+  git_in(&root, &["commit", "-m", "add part"]);
+  git_in(&root, &["checkout", "-b", "feature"]);
+  (tmp, root, config)
+}
+
+/// A change reaching a destructured export through its initializer must reach
+/// the importers of the names it binds: `part` changes, `index.ts` references
+/// it inside `export const { widget, other } = createKit({ part })`, and `app`
+/// imports `widget`. The reference resolved to no enclosing symbol, so the
+/// trace stopped at `index.ts`.
+#[test]
+fn test_change_reaching_destructured_export_affects_importers() {
+  let (_tmp, root, config) = scaffold_destructured_export_repo();
+  fs::write(
+    root.join("libs/lib/src/part.ts"),
+    "export const part = () => 2;\n",
+  )
+  .unwrap();
+  git_in(&root, &["add", "."]);
+  git_in(&root, &["commit", "-m", "change part"]);
+
+  let profiler = Arc::new(Profiler::new(false));
+  let mut affected = find_affected(config, profiler)
+    .expect("find_affected failed")
+    .affected_projects;
+  affected.sort();
+
+  assert_eq!(
+    affected,
+    vec!["app".to_string(), "lib".to_string()],
+    "app imports `widget`, bound by the destructured export that references the changed `part`"
+  );
+}
+
+/// An edit inside the initializer of a destructured export changes every name
+/// it binds, so the importers of `widget` are affected.
+#[test]
+fn test_change_inside_destructured_export_affects_importers() {
+  let (_tmp, root, config) = scaffold_destructured_export_repo();
+  let index = root.join("libs/lib/src/index.ts");
+  let source = fs::read_to_string(&index).unwrap();
+  fs::write(&index, source.replace("  part,\n", "  part: () => 2,\n")).unwrap();
+  git_in(&root, &["add", "."]);
+  git_in(&root, &["commit", "-m", "change the kit"]);
+
+  let profiler = Arc::new(Profiler::new(false));
+  let mut affected = find_affected(config, profiler)
+    .expect("find_affected failed")
+    .affected_projects;
+  affected.sort();
+
+  assert_eq!(
+    affected,
+    vec!["app".to_string(), "lib".to_string()],
+    "app imports `widget`, bound by the destructured export whose initializer changed"
+  );
+}
+
 /// A workspace root that is not in canonical form (relative, containing `..`,
 /// or reached through a symlink) must give the same result as the canonical
 /// one. `oxc_resolver` returns realpaths, and the import index made them
