@@ -179,6 +179,15 @@ pub struct WorkspaceAnalyzer {
   pub profiler: Arc<Profiler>,
 }
 
+/// A position being resolved to its enclosing symbol, with the bounds of its
+/// line: byte offsets into the source, `line_end` inclusive.
+#[derive(Clone, Copy)]
+struct LinePosition {
+  offset: usize,
+  line_start: usize,
+  line_end: usize,
+}
+
 impl WorkspaceAnalyzer {
   /// Create a new workspace analyzer
   ///
@@ -816,10 +825,12 @@ impl WorkspaceAnalyzer {
     if let Some(decl) = &export_decl.declaration {
       match decl {
         oxc_ast::ast::Declaration::VariableDeclaration(var_decl) => {
+          // `export const { a, b: c } = init` and `export const [x, y] = init`
+          // export every name the pattern binds.
           for declarator in &var_decl.declarations {
-            if let oxc_ast::ast::BindingPatternKind::BindingIdentifier(id) = &declarator.id.kind {
+            for name in Self::declarator_binding_names(declarator) {
               exports.push(Export {
-                exported_name: id.name.to_string(),
+                exported_name: name,
                 local_name: None,
                 re_export_from: None,
                 is_type_only: false,
@@ -1106,19 +1117,97 @@ impl WorkspaceAnalyzer {
     crate::utils::offset_to_line_col(source, offset)
   }
 
-  /// Extract the first binding identifier name from a `VariableDeclaration`.
-  ///
-  /// Returns the name of the first `BindingIdentifier` found among the declarators,
-  /// or `None` if there are no binding identifiers.
-  fn first_binding_name_from_var_decl(
+  /// The names bound by the first declarator of a `VariableDeclaration` that
+  /// binds any: `a` for `const a = 1, b = 2`, `a` and `c` for
+  /// `const { a, b: c } = obj`, `x` and `y` for `const [x, y] = arr`. Empty
+  /// when no declarator binds a name (`const {} = obj`).
+  fn first_binding_names_from_var_decl(
     var_decl: &oxc_ast::ast::VariableDeclaration,
-  ) -> Option<String> {
-    for declarator in &var_decl.declarations {
-      if let oxc_ast::ast::BindingPatternKind::BindingIdentifier(ident) = &declarator.id.kind {
-        return Some(ident.name.to_string());
+  ) -> Vec<String> {
+    var_decl
+      .declarations
+      .iter()
+      .map(Self::declarator_binding_names)
+      .find(|names| !names.is_empty())
+      .unwrap_or_default()
+  }
+
+  /// The names bound by the declarators of `var_decl` a position falls in:
+  /// the declarator containing `at.offset`, else every declarator overlapping
+  /// its line, else the first declarator binding any. Changed lines are
+  /// checked at column 0, which on `  { b } = make(x)`, a later declarator of
+  /// `export const a = 1,`, falls on the indentation before it.
+  fn binding_names_at(
+    var_decl: &oxc_ast::ast::VariableDeclaration,
+    at: LinePosition,
+  ) -> Vec<String> {
+    let names_of = |declarators: Vec<&VariableDeclarator>| -> Vec<String> {
+      declarators
+        .into_iter()
+        .flat_map(Self::declarator_binding_names)
+        .collect()
+    };
+    let containing = names_of(
+      var_decl
+        .declarations
+        .iter()
+        .filter(|declarator| {
+          (declarator.span.start as usize) <= at.offset && at.offset <= declarator.span.end as usize
+        })
+        .collect(),
+    );
+    if !containing.is_empty() {
+      return containing;
+    }
+    let on_line = names_of(
+      var_decl
+        .declarations
+        .iter()
+        .filter(|declarator| {
+          (declarator.span.start as usize) <= at.line_end
+            && at.line_start <= declarator.span.end as usize
+        })
+        .collect(),
+    );
+    if !on_line.is_empty() {
+      return on_line;
+    }
+    Self::first_binding_names_from_var_decl(var_decl)
+  }
+
+  /// Every name a declarator binds, through object and array patterns,
+  /// defaults and rest elements included.
+  fn declarator_binding_names(declarator: &VariableDeclarator) -> Vec<String> {
+    let mut names = Vec::new();
+    Self::collect_binding_names(&declarator.id.kind, &mut names);
+    names
+  }
+
+  /// `BindingPattern::get_binding_identifiers` skips rest elements, which bind
+  /// a name as much as any property (`export const { a, ...rest } = obj`).
+  fn collect_binding_names(pattern: &BindingPatternKind, names: &mut Vec<String>) {
+    match pattern {
+      BindingPatternKind::BindingIdentifier(ident) => names.push(ident.name.to_string()),
+      BindingPatternKind::ObjectPattern(object) => {
+        for property in &object.properties {
+          Self::collect_binding_names(&property.value.kind, names);
+        }
+        if let Some(rest) = &object.rest {
+          Self::collect_binding_names(&rest.argument.kind, names);
+        }
+      }
+      BindingPatternKind::ArrayPattern(array) => {
+        for element in array.elements.iter().flatten() {
+          Self::collect_binding_names(&element.kind, names);
+        }
+        if let Some(rest) = &array.rest {
+          Self::collect_binding_names(&rest.argument.kind, names);
+        }
+      }
+      BindingPatternKind::AssignmentPattern(assignment) => {
+        Self::collect_binding_names(&assignment.left.kind, names);
       }
     }
-    None
   }
 
   /// Helper method to extract symbol name from an export declaration
@@ -1130,31 +1219,35 @@ impl WorkspaceAnalyzer {
   /// - export interface X {}
   /// - export type X = ...
   /// - export enum X {}
-  fn extract_symbol_from_export_decl(decl: &oxc_ast::ast::Declaration) -> Option<String> {
+  fn extract_symbol_from_export_decl(
+    decl: &oxc_ast::ast::Declaration,
+    at: LinePosition,
+  ) -> Vec<String> {
+    let single = |name: Option<String>| name.into_iter().collect();
     match decl {
       oxc_ast::ast::Declaration::VariableDeclaration(var_decl) => {
-        Self::first_binding_name_from_var_decl(var_decl)
+        Self::binding_names_at(var_decl, at)
       }
       oxc_ast::ast::Declaration::FunctionDeclaration(func_decl) => {
-        func_decl.id.as_ref().map(|id| id.name.to_string())
+        single(func_decl.id.as_ref().map(|id| id.name.to_string()))
       }
       oxc_ast::ast::Declaration::ClassDeclaration(class_decl) => {
-        class_decl.id.as_ref().map(|id| id.name.to_string())
+        single(class_decl.id.as_ref().map(|id| id.name.to_string()))
       }
       oxc_ast::ast::Declaration::TSInterfaceDeclaration(interface) => {
-        Some(interface.id.name.to_string())
+        vec![interface.id.name.to_string()]
       }
       oxc_ast::ast::Declaration::TSTypeAliasDeclaration(type_alias) => {
-        Some(type_alias.id.name.to_string())
+        vec![type_alias.id.name.to_string()]
       }
       oxc_ast::ast::Declaration::TSEnumDeclaration(enum_decl) => {
-        Some(enum_decl.id.name.to_string())
+        vec![enum_decl.id.name.to_string()]
       }
       oxc_ast::ast::Declaration::TSModuleDeclaration(module_decl) => match &module_decl.id {
-        oxc_ast::ast::TSModuleDeclarationName::Identifier(id) => Some(id.name.to_string()),
-        oxc_ast::ast::TSModuleDeclarationName::StringLiteral(_) => None,
+        oxc_ast::ast::TSModuleDeclarationName::Identifier(id) => vec![id.name.to_string()],
+        oxc_ast::ast::TSModuleDeclarationName::StringLiteral(_) => Vec::new(),
       },
-      _ => None,
+      _ => Vec::new(),
     }
   }
 
@@ -1283,7 +1376,9 @@ impl WorkspaceAnalyzer {
   }
 
   /// Resolve the enclosing top-level symbol(s) at `line`/`column` within an
-  /// already-parsed file. Shared by [`WorkspaceAnalyzer::find_node_at_line`]
+  /// already-parsed file. A position inside a destructuring declaration
+  /// (`const { a, b } = f()`) resolves to every name the pattern binds: the
+  /// initializer is shared, so a change there cannot be pinned to one of them. Shared by [`WorkspaceAnalyzer::find_node_at_line`]
   /// (working-tree files) and [`WorkspaceAnalyzer::find_deleted_changes`]
   /// (base-revision snapshots of deleted code). Takes `&FileSemanticData`
   /// rather than `&self` so it can run against a one-off parse that never
@@ -1300,6 +1395,11 @@ impl WorkspaceAnalyzer {
     let line_end = crate::utils::line_to_offset(file_data.source(), line + 1)
       .unwrap_or(file_data.source().len());
     let line_end_inclusive = line_end.saturating_sub(1);
+    let position = LinePosition {
+      offset: exact_offset,
+      line_start,
+      line_end: line_end_inclusive,
+    };
 
     let specifier_names_on_line = |export_decl: &ExportNamedDeclaration| -> Vec<String> {
       export_decl
@@ -1366,7 +1466,7 @@ impl WorkspaceAnalyzer {
 
     // Find the containing top-level declaration (exported symbol)
     let mut current_id = node_on_line_id.unwrap();
-    let mut top_level_name: Option<String> = None;
+    let mut top_level_names: Vec<String> = Vec::new();
 
     // Flag to track if we've encountered an export wrapper (ExportNamedDeclaration or ExportDefaultDeclaration)
     // This is important because we want to extract the symbol from the export declaration itself,
@@ -1382,9 +1482,9 @@ impl WorkspaceAnalyzer {
         found_export_wrapper = true;
         // Check if there's an inline declaration (export const x = ...)
         if let Some(decl) = &export_decl.declaration {
-          top_level_name = Self::extract_symbol_from_export_decl(decl);
+          top_level_names = Self::extract_symbol_from_export_decl(decl, position);
         }
-        if top_level_name.is_none() && !export_decl.specifiers.is_empty() {
+        if top_level_names.is_empty() && !export_decl.specifiers.is_empty() {
           let specifier_names = specifier_names_on_line(export_decl);
           if !specifier_names.is_empty() {
             return Ok(specifier_names);
@@ -1393,7 +1493,7 @@ impl WorkspaceAnalyzer {
       }
       AstKind::ExportDefaultDeclaration(_) => {
         found_export_wrapper = true;
-        top_level_name = Some("default".to_string());
+        top_level_names = vec!["default".to_string()];
       }
       AstKind::VariableDeclaration(var_decl) => {
         // Handle non-exported variable declarations (e.g., `const x = ...`).
@@ -1401,16 +1501,14 @@ impl WorkspaceAnalyzer {
         // inside the VariableDeclaration span but OUTSIDE the VariableDeclarator span.
         // Without this arm the walk-up loop would never encounter VariableDeclarator
         // (it is a child, not an ancestor) and the function would return empty.
-        top_level_name = Self::first_binding_name_from_var_decl(var_decl);
+        top_level_names = Self::binding_names_at(var_decl, position);
       }
       _ => {}
     }
 
     // If we found the symbol at the current node level, return it early
-    if found_export_wrapper {
-      if let Some(name) = top_level_name.take() {
-        return Ok(vec![name]);
-      }
+    if found_export_wrapper && !top_level_names.is_empty() {
+      return Ok(top_level_names);
     }
 
     // Walk up the tree to find a top-level exported declaration
@@ -1428,9 +1526,9 @@ impl WorkspaceAnalyzer {
           found_export_wrapper = true;
           // Check if there's an inline declaration (export const x = ...)
           if let Some(decl) = &export_decl.declaration {
-            top_level_name = Self::extract_symbol_from_export_decl(decl);
+            top_level_names = Self::extract_symbol_from_export_decl(decl, position);
           }
-          if top_level_name.is_none() && !export_decl.specifiers.is_empty() {
+          if top_level_names.is_empty() && !export_decl.specifiers.is_empty() {
             let specifier_names = specifier_names_on_line(export_decl);
             if !specifier_names.is_empty() {
               return Ok(specifier_names);
@@ -1439,52 +1537,54 @@ impl WorkspaceAnalyzer {
         }
         AstKind::ExportDefaultDeclaration(_) => {
           found_export_wrapper = true;
-          top_level_name = Some("default".to_string());
+          top_level_names = vec!["default".to_string()];
         }
         // Top-level declarations that can be exported
         AstKind::Function(func) if !found_export_wrapper => {
           if let Some(id) = &func.id {
-            top_level_name = Some(id.name.to_string());
+            top_level_names = vec![id.name.to_string()];
           }
         }
         AstKind::Class(class) if !found_export_wrapper => {
           if let Some(id) = &class.id {
-            top_level_name = Some(id.name.to_string());
+            top_level_names = vec![id.name.to_string()];
           }
         }
         AstKind::TSInterfaceDeclaration(interface) if !found_export_wrapper => {
-          top_level_name = Some(interface.id.name.to_string());
+          top_level_names = vec![interface.id.name.to_string()];
         }
         AstKind::TSTypeAliasDeclaration(type_alias) if !found_export_wrapper => {
-          top_level_name = Some(type_alias.id.name.to_string());
+          top_level_names = vec![type_alias.id.name.to_string()];
         }
         AstKind::TSEnumDeclaration(enum_decl) if !found_export_wrapper => {
-          top_level_name = Some(enum_decl.id.name.to_string());
+          top_level_names = vec![enum_decl.id.name.to_string()];
         }
         AstKind::TSModuleDeclaration(module_decl) if !found_export_wrapper => {
           if let oxc_ast::ast::TSModuleDeclarationName::Identifier(id) = &module_decl.id {
-            top_level_name = Some(id.name.to_string());
+            top_level_names = vec![id.name.to_string()];
           }
         }
         AstKind::VariableDeclarator(var_decl) if !found_export_wrapper => {
-          // For const/let declarations, get the binding name
-          if let oxc_ast::ast::BindingPatternKind::BindingIdentifier(ident) = &var_decl.id.kind {
-            top_level_name = Some(ident.name.to_string());
+          // For const/let declarations, get the names the declarator binds,
+          // destructuring patterns included
+          let names = Self::declarator_binding_names(var_decl);
+          if !names.is_empty() {
+            top_level_names = names;
           }
         }
         AstKind::VariableDeclaration(var_decl)
-          if !found_export_wrapper && top_level_name.is_none() =>
+          if !found_export_wrapper && top_level_names.is_empty() =>
         {
           // Same rationale as the initial-node check: when walking up from a position
           // inside the `const`/`let`/`var` keyword we hit VariableDeclaration before
           // VariableDeclarator (its child).
-          top_level_name = Self::first_binding_name_from_var_decl(var_decl);
+          top_level_names = Self::binding_names_at(var_decl, position);
         }
         _ => {}
       }
 
       // If we found a symbol from an export wrapper, we can stop
-      if found_export_wrapper && top_level_name.is_some() {
+      if found_export_wrapper && !top_level_names.is_empty() {
         break;
       }
 
@@ -1494,7 +1594,7 @@ impl WorkspaceAnalyzer {
     // Return the top-level declaration if found, otherwise empty
     // When empty is returned, it means the line doesn't contain a trackable symbol
     // (e.g., object literal properties, comments, or code not in a top-level declaration)
-    Ok(top_level_name.map(|name| vec![name]).unwrap_or_default())
+    Ok(top_level_names)
   }
 
   /// Recover what a set of deleted *base-revision* lines changed: the top-level
@@ -1876,37 +1976,103 @@ var localVar = 2"#;
 
   #[test]
   fn test_find_node_at_line_non_exported_destructuring_column_zero() {
-    // Documents known limitation: destructuring patterns (e.g., `const { a, b } = obj`)
-    // return empty because first_binding_name_from_var_decl only matches BindingIdentifier,
-    // not ObjectPattern or ArrayPattern.
-    let source = r#"const { a, b } = { a: 1, b: 2 }
-const [x, y] = [1, 2]"#;
+    // A destructuring declaration resolves to every name it binds, at column 0
+    // (the `const` keyword) as inside the pattern.
+    let source = r#"const { a, b: renamed, ...rest } = { a: 1, b: 2, c: 3 }
+const [x, , y = 2, ...others] = [1, 2]
+const {} = {}
+const { n: { deep = 1 }, list: [first] } = source"#;
 
     let (analyzer, file_path) = create_analyzer_with_file(source, "test.ts");
 
-    // Object destructuring at column 0 — returns empty (no simple BindingIdentifier)
     let result = analyzer.find_node_at_line(&file_path, 1, 0);
-    assert!(result.is_ok());
+    assert_eq!(
+      result.unwrap(),
+      vec!["a".to_string(), "renamed".to_string(), "rest".to_string()]
+    );
+
+    let result = analyzer.find_node_at_line(&file_path, 2, 0);
+    assert_eq!(
+      result.unwrap(),
+      vec!["x".to_string(), "y".to_string(), "others".to_string()]
+    );
+
+    // A pattern binding nothing resolves to nothing
+    let result = analyzer.find_node_at_line(&file_path, 3, 0);
     assert_eq!(result.unwrap(), Vec::<String>::new());
 
-    // Array destructuring at column 0 — also returns empty
+    // Nested patterns and defaults
+    let result = analyzer.find_node_at_line(&file_path, 4, 0);
+    assert_eq!(
+      result.unwrap(),
+      vec!["deep".to_string(), "first".to_string()]
+    );
+  }
+
+  #[test]
+  fn test_find_node_at_line_later_declarator_of_export() {
+    // A change inside a later declarator of a multi-declarator export resolves
+    // to that declarator's names, not to the first one's.
+    let source = r#"export const first = 1,
+  { second, third } = make(
+    input,
+  );"#;
+
+    let (analyzer, file_path) = create_analyzer_with_file(source, "test.ts");
+
+    let result = analyzer.find_node_at_line(&file_path, 3, 4);
+    assert_eq!(
+      result.unwrap(),
+      vec!["second".to_string(), "third".to_string()]
+    );
+
+    // A change inside the first declarator still resolves to it
+    let result = analyzer.find_node_at_line(&file_path, 1, 13);
+    assert_eq!(result.unwrap(), vec!["first".to_string()]);
+  }
+
+  #[test]
+  fn test_find_node_at_line_later_declarator_first_line_column_zero() {
+    // Changed lines are checked at column 0, which on an indented later
+    // declarator falls before it: the declarator overlapping the line is used.
+    let source = r#"export const first = 1,
+  { widget } = make(2);"#;
+
+    let (analyzer, file_path) = create_analyzer_with_file(source, "test.ts");
+
     let result = analyzer.find_node_at_line(&file_path, 2, 0);
-    assert!(result.is_ok());
-    assert_eq!(result.unwrap(), Vec::<String>::new());
+    assert_eq!(result.unwrap(), vec!["widget".to_string()]);
+  }
+
+  #[test]
+  fn test_find_node_at_line_reference_in_destructured_export_initializer() {
+    // A reference inside the initializer of a destructured export belongs to
+    // every name the pattern binds: a change reaching `part` reaches the
+    // importers of `widget` and `other`.
+    let source = r#"import { part } from "./part";
+export const { widget, other } = createKit({
+  part,
+});"#;
+
+    let (analyzer, file_path) = create_analyzer_with_file(source, "test.ts");
+
+    let result = analyzer.find_node_at_line(&file_path, 3, 2);
+    assert_eq!(
+      result.unwrap(),
+      vec!["widget".to_string(), "other".to_string()]
+    );
   }
 
   #[test]
   fn test_find_node_at_line_multiple_declarators_column_zero() {
-    // `const a = 1, b = 2` at column 0 returns only the first declarator ("a").
-    // This is by design: first_binding_name_from_var_decl returns the first
-    // BindingIdentifier found.
+    // `const a = 1, b = 2` at column 0 (the `const` keyword) resolves to both
+    // declarators: a change on that line can be in either.
     let source = "const a = 1, b = 2";
 
     let (analyzer, file_path) = create_analyzer_with_file(source, "test.ts");
 
     let result = analyzer.find_node_at_line(&file_path, 1, 0);
-    assert!(result.is_ok());
-    assert_eq!(result.unwrap(), vec!["a".to_string()]);
+    assert_eq!(result.unwrap(), vec!["a".to_string(), "b".to_string()]);
   }
 
   #[test]
@@ -2397,7 +2563,7 @@ const DynamicImport = await import('./dynamic');
 
   #[test]
   fn test_find_node_at_line_destructured_export() {
-    // Test finding destructured exports - should find the first identifier
+    // A destructured export resolves to every name it binds
     let source = r#"const obj = { a: 1, b: 2 };
 export const { a, b } = obj;"#;
 
@@ -2431,10 +2597,7 @@ export const { a, b } = obj;"#;
     );
 
     let result = analyzer.find_node_at_line(file_path, 2, 0);
-    // Note: For destructured exports, we currently don't extract individual binding identifiers
-    // This is a known limitation - the helper returns None for destructuring patterns
-    // In the future, we may want to handle this case specially
-    assert!(result.is_ok(), "Should not error: {:?}", result);
+    assert_eq!(result.unwrap(), vec!["a".to_string(), "b".to_string()]);
   }
 
   #[test]
@@ -3117,6 +3280,27 @@ const { ...rest } = ns;
       refs.iter().map(|r| r.line).collect::<Vec<_>>(),
       vec![18],
       "`const {{ other: renamed }} = ns` reads `ns.other`"
+    );
+  }
+
+  #[test]
+  fn test_extract_destructured_exports() {
+    let source = r#"export const { a, b: renamed, ...rest } = obj;
+export const [x, , y = 1] = arr;
+export const plain = 1;
+"#;
+    let allocator = Allocator::default();
+    let parse_result = Parser::new(&allocator, source, SourceType::ts()).parse();
+    let exports = WorkspaceAnalyzer::extract_exports(&parse_result.program);
+
+    let names: Vec<_> = exports
+      .iter()
+      .map(|export| export.exported_name.as_str())
+      .collect();
+    assert_eq!(
+      names,
+      vec!["a", "renamed", "rest", "x", "y", "plain"],
+      "a destructured export exports every name its pattern binds"
     );
   }
 
