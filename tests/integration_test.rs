@@ -8784,6 +8784,10 @@ fn test_dynamic_import_module_used_as_a_value_reads_every_export() {
         "export async function listExports() {\n  const widget = await import(\"./lib/widget\");\n  return Object.keys(widget);\n}\n",
       ),
       (
+        "arguments.ts",
+        "export const loadAll = () =>\n  import(\"./lib/widget\").then(function (widget) {\n    return arguments[0].widgetOptions;\n  });\n",
+      ),
+      (
         "rest.ts",
         "export async function readRest() {\n  const { unrelatedHelper, ...others } = await import(\"./lib/widget\");\n  return [unrelatedHelper, others];\n}\n",
       ),
@@ -8793,7 +8797,13 @@ fn test_dynamic_import_module_used_as_a_value_reads_every_export() {
 
   assert_eq!(
     via_files,
-    paths(&["argument.ts", "awaited.ts", "callback.ts", "rest.ts"]),
+    paths(&[
+      "argument.ts",
+      "arguments.ts",
+      "awaited.ts",
+      "callback.ts",
+      "rest.ts"
+    ]),
     "a module handed over as a value, or destructured with a rest element, has every \
      export read"
   );
@@ -8860,6 +8870,18 @@ fn test_dynamic_import_binding_reads_the_default_export_only_when_named() {
         "ignores-module.ts",
         "export const ping = () => import(\"./lib/panel\").then(() => true);\n",
       ),
+      (
+        "arguments.ts",
+        "export const loadPanel = () =>\n  import(\"./lib/panel\").then(function () {\n    return arguments[0].default;\n  });\n",
+      ),
+      (
+        "rest.ts",
+        "export const loadPanel = () =>\n  import(\"./lib/panel\").then((...args) => args[0].default);\n",
+      ),
+      (
+        "first-and-rest.ts",
+        "export const loadPanel = () =>\n  import(\"./lib/panel\").then((first, ...more) => [first, more]);\n",
+      ),
     ],
     &[(
       "lib/panel.ts",
@@ -8869,9 +8891,17 @@ fn test_dynamic_import_binding_reads_the_default_export_only_when_named() {
 
   assert_eq!(
     via_files,
-    paths(&["default-read.ts", "passthrough.ts", "unbound.ts"]),
+    paths(&[
+      "arguments.ts",
+      "default-read.ts",
+      "first-and-rest.ts",
+      "passthrough.ts",
+      "rest.ts",
+      "unbound.ts",
+    ]),
     "a bound import() reads the default export only when it names it; .then() without a \
-     callback passes the module on unbound, and a callback without a parameter reads nothing"
+     callback passes the module on unbound, a callback reading arguments or a rest element \
+     receives the whole module, and an arrow without a parameter reads nothing"
   );
 }
 

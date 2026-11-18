@@ -32,6 +32,7 @@ exempt: they land by force-push, and their commits against `main` are upstream's
 
 | Patch | Upstream PR | State |
 | --- | --- | --- |
+| `fix(semantic): read the module through arguments and rest parameters of a .then callback` | not submitted | worth sending with the bound dynamic import patch |
 | `fix(semantic): trace the members read off a bound dynamic import` | not submitted | worth sending with the dynamic-import cascade patch; upstream still isolates named exports behind `import()` at `v2.2.1` |
 | `fix(semantic): trace the names bound by destructured declarations` | not submitted | worth sending; upstream ignores destructured declarations at `v2.2.1` |
 | `feat(cli): add --report-format to write the report as JSON` | not submitted | worth sending; upstream's `--report` writes HTML only |

@@ -1,3 +1,4 @@
+fix(semantic): read the module through arguments and rest parameters of a .then callback | not submitted
 fix(semantic): trace the members read off a bound dynamic import | not submitted
 fix(semantic): trace the names bound by destructured declarations | not submitted
 feat(cli): add --report-format to write the report as JSON | not submitted
