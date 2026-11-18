@@ -4,7 +4,8 @@ use crate::types::{Export, Import, Project, Reference};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
   BindingPatternKind, ExportNamedDeclaration, Expression, ImportDeclaration,
-  ImportDeclarationSpecifier, JSXMemberExpressionObject, Statement, VariableDeclarator,
+  ImportDeclarationSpecifier, JSXMemberExpressionObject, ObjectPattern, Statement,
+  VariableDeclarator,
 };
 use oxc_ast::AstKind;
 use oxc_ast_visit::walk;
@@ -28,6 +29,30 @@ type ImportIndexValue = (PathBuf, String, String, bool);
 type ImportIndexEntry = Vec<ImportIndexValue>;
 /// Type alias for the import index map: (source_file, symbol_name) -> entries
 type ImportIndexMap = FxHashMap<(PathBuf, String), ImportIndexEntry>;
+
+/// What the code reads off the module a bound dynamic `import()` loads (see
+/// [`WorkspaceAnalyzer::find_dynamic_import_reads`]).
+#[derive(Debug, Default)]
+pub struct DynamicImportReads {
+  /// Each export read by name (`module.name`, `const { name } = module`), with
+  /// where it is read.
+  pub members: Vec<(String, Reference)>,
+  /// Each use of the module object as a value (`register(module)`), which reads
+  /// every export.
+  pub value_uses: Vec<Reference>,
+}
+
+/// How a dynamic `import()` binds the module it loads.
+enum DynamicImportBinding<'s> {
+  /// A `.then` callback parameter or an awaited declaration.
+  Pattern(&'s oxc_ast::ast::BindingPattern<'s>),
+  /// `(await import("m")).name`
+  Member(&'s str, Span),
+  /// The module is handed to a callback that is not a function literal.
+  Value(Span),
+  /// A `.then` callback without a parameter.
+  Nothing,
+}
 /// Type alias for reverse re-export index entries: (reexporting_file, export)
 type ReexportIndexEntry = Vec<(PathBuf, Export)>;
 /// Type alias for the reverse re-export index map: resolved_source_file -> entries
@@ -627,7 +652,7 @@ impl<'a> DynamicImportVisitor<'a> {
   /// Since we can't statically analyze which symbols are accessed from dynamic imports
   /// (especially with .then() transformations), we conservatively treat them as
   /// namespace imports (import * as ...) to ensure we track the dependency.
-  fn create_namespace_import(&self, from_module: &str) -> Import {
+  fn create_namespace_import(&self, from_module: &str, start: u32) -> Import {
     Import {
       imported_name: "*".to_string(),
       local_name: format!("__dynamic_import_{}", self.dynamic_count),
@@ -635,6 +660,7 @@ impl<'a> DynamicImportVisitor<'a> {
       resolved_file: None,
       is_type_only: false,
       is_dynamic: true,
+      dynamic_import_start: Some(start),
     }
   }
 }
@@ -648,7 +674,7 @@ impl<'a> Visit<'a> for DynamicImportVisitor<'a> {
         debug!("Found dynamic import: {}", from_module);
 
         // Create a namespace import for this dynamic import
-        let import = self.create_namespace_import(&from_module);
+        let import = self.create_namespace_import(&from_module, expr.span.start);
         self.imports.push(import);
         self.dynamic_count += 1;
       }
@@ -717,6 +743,7 @@ impl WorkspaceAnalyzer {
               resolved_file: None, // Will be resolved later
               is_type_only: is_type_only || spec.import_kind.is_type(),
               is_dynamic: false,
+              dynamic_import_start: None,
             });
           }
           ImportDeclarationSpecifier::ImportDefaultSpecifier(spec) => {
@@ -727,6 +754,7 @@ impl WorkspaceAnalyzer {
               resolved_file: None,
               is_type_only,
               is_dynamic: false,
+              dynamic_import_start: None,
             });
           }
           ImportDeclarationSpecifier::ImportNamespaceSpecifier(spec) => {
@@ -737,6 +765,7 @@ impl WorkspaceAnalyzer {
               resolved_file: None,
               is_type_only,
               is_dynamic: false,
+              dynamic_import_start: None,
             });
           }
         }
@@ -754,6 +783,7 @@ impl WorkspaceAnalyzer {
         resolved_file: None,
         is_type_only: false,
         is_dynamic: false,
+        dynamic_import_start: None,
       });
     }
 
@@ -1030,6 +1060,12 @@ impl WorkspaceAnalyzer {
     let BindingPatternKind::ObjectPattern(pattern) = &declarator.id.kind else {
       return None;
     };
+    Self::object_pattern_members(pattern)
+  }
+
+  /// The members an object pattern reads (`{ a, b: c }`), or `None` when it
+  /// reads more than named members: a rest element (`...rest`) or a computed key.
+  fn object_pattern_members(pattern: &ObjectPattern) -> Option<Vec<String>> {
     if pattern.rest.is_some() {
       return None;
     }
@@ -1109,6 +1145,216 @@ impl WorkspaceAnalyzer {
     }
 
     Ok(references)
+  }
+
+  /// What the code reads off the module a dynamic `import()` loads, for an
+  /// `import()` that binds the module to a name, `None` otherwise.
+  ///
+  /// `import_start` is the start offset of the `import()` expression in
+  /// `file_path` ([`Import::dynamic_import_start`]). The module is bound by:
+  ///
+  /// - `import("m").then((module) => …)`, `.then(({ name }) => …)`
+  /// - `const module = await import("m")`, `const { name } = await import("m")`
+  /// - `(await import("m")).name`
+  ///
+  /// The bound name is followed through its own references, scope by scope, as
+  /// a namespace import binding is: `module.name` reads one export, any other
+  /// runtime use hands the module object over and reads all of them, and so
+  /// does exporting the binding itself. A callback that is not a function
+  /// literal (`.then(register)`) receives the module, so it reads all of them
+  /// too, while a callback without a parameter (`.then(() => …)`) reads none.
+  ///
+  /// An unbound `import()` (`lazy(() => import("m"))`, `return import("m")`,
+  /// `.then()` without a callback) hands its promise to code this analysis
+  /// does not follow, so it returns `None`, and the caller keeps its rule for it.
+  pub fn find_dynamic_import_reads(
+    &self,
+    file_path: &Path,
+    import_start: u32,
+  ) -> Result<Option<DynamicImportReads>> {
+    let file_data = self
+      .files
+      .get(file_path)
+      .ok_or_else(|| DominoError::FileNotFound(file_path.display().to_string()))?;
+    let semantic = file_data.semantic();
+    let nodes = semantic.nodes();
+    let Some(import_node) = nodes.iter().find(|node| {
+      matches!(node.kind(), AstKind::ImportExpression(expr) if expr.span.start == import_start)
+    }) else {
+      return Ok(None);
+    };
+    let Some(binding) = Self::dynamic_import_binding(nodes, import_node.id()) else {
+      return Ok(None);
+    };
+
+    // (member, where it is read) and where the module is used as a value
+    let mut members: Vec<(String, Span)> = Vec::new();
+    let mut value_uses: Vec<Span> = Vec::new();
+
+    match binding {
+      DynamicImportBinding::Pattern(pattern) => match &pattern.kind {
+        BindingPatternKind::BindingIdentifier(identifier) => match identifier.symbol_id.get() {
+          Some(symbol_id) => {
+            let scoping = semantic.scoping();
+            // `export const module = await import("m")` hands the module to every
+            // importer of the binding, without a reference in this file.
+            if scoping.symbol_scope_id(symbol_id) == scoping.root_scope_id()
+              && self.is_symbol_exported(file_path, identifier.name.as_str())
+            {
+              value_uses.push(identifier.span);
+            }
+            for reference in semantic.symbol_references(symbol_id) {
+              let flags = reference.flags();
+              if flags.is_type() || flags.is_value_as_type() {
+                continue;
+              }
+              let node_id = reference.node_id();
+              let span = nodes.get_node(node_id).kind().span();
+              match nodes.parent_kind(node_id) {
+                AstKind::StaticMemberExpression(member_expr)
+                  if member_expr.object.span() == span =>
+                {
+                  members.push((member_expr.property.name.to_string(), member_expr.span));
+                }
+                AstKind::JSXMemberExpression(member_expr) => {
+                  members.push((member_expr.property.name.to_string(), member_expr.span));
+                }
+                AstKind::VariableDeclarator(declarator)
+                  if declarator
+                    .init
+                    .as_ref()
+                    .is_some_and(|init| init.span() == span) =>
+                {
+                  match Self::destructured_members(declarator) {
+                    Some(names) => {
+                      members.extend(names.into_iter().map(|name| (name, declarator.span)))
+                    }
+                    None => value_uses.push(span),
+                  }
+                }
+                _ => value_uses.push(span),
+              }
+            }
+          }
+          // Not bound by semantic analysis: nothing tells what reads it.
+          None => value_uses.push(pattern.span()),
+        },
+        BindingPatternKind::ObjectPattern(object_pattern) => {
+          match Self::object_pattern_members(object_pattern) {
+            Some(names) => members.extend(names.into_iter().map(|name| (name, pattern.span()))),
+            None => value_uses.push(pattern.span()),
+          }
+        }
+        BindingPatternKind::ArrayPattern(_) | BindingPatternKind::AssignmentPattern(_) => {
+          value_uses.push(pattern.span());
+        }
+      },
+      DynamicImportBinding::Member(name, span) => members.push((name.to_string(), span)),
+      DynamicImportBinding::Value(span) => value_uses.push(span),
+      DynamicImportBinding::Nothing => {}
+    }
+
+    let reference_at = |span: Span| {
+      let (line, column) = self.span_to_line_col(file_data.source(), span);
+      Reference {
+        file_path: file_path.to_path_buf(),
+        line,
+        column,
+      }
+    };
+    Ok(Some(DynamicImportReads {
+      members: members
+        .into_iter()
+        .map(|(name, span)| (name, reference_at(span)))
+        .collect(),
+      value_uses: value_uses.into_iter().map(reference_at).collect(),
+    }))
+  }
+
+  /// How the `import()` expression `import_id` binds the module it loads, if
+  /// it does (see [`WorkspaceAnalyzer::find_dynamic_import_reads`]).
+  fn dynamic_import_binding<'s>(
+    nodes: &'s oxc_semantic::AstNodes<'s>,
+    import_id: oxc_semantic::NodeId,
+  ) -> Option<DynamicImportBinding<'s>> {
+    let (outer_id, outer_span) = Self::outermost_wrapper(nodes, import_id);
+    match nodes.parent_kind(outer_id) {
+      // import("m").then(callback)
+      AstKind::StaticMemberExpression(member_expr)
+        if member_expr.object.span() == outer_span && member_expr.property.name == "then" =>
+      {
+        let member_id = nodes.parent_id(outer_id);
+        let AstKind::CallExpression(call) = nodes.parent_kind(member_id) else {
+          return None;
+        };
+        if call.callee.span() != member_expr.span {
+          return None;
+        }
+        // `.then()` passes the module on unchanged, like an unbound import().
+        let callback = call.arguments.first()?;
+        let parameters = match callback
+          .as_expression()
+          .map(Expression::without_parentheses)
+        {
+          Some(Expression::ArrowFunctionExpression(arrow)) => &arrow.params,
+          Some(Expression::FunctionExpression(function)) => &function.params,
+          _ => return Some(DynamicImportBinding::Value(callback.span())),
+        };
+        Some(match parameters.items.first() {
+          Some(parameter) => DynamicImportBinding::Pattern(&parameter.pattern),
+          None => DynamicImportBinding::Nothing,
+        })
+      }
+      // await import("m")
+      AstKind::AwaitExpression(await_expr) if await_expr.argument.span() == outer_span => {
+        let (await_id, await_span) = Self::outermost_wrapper(nodes, nodes.parent_id(outer_id));
+        match nodes.parent_kind(await_id) {
+          AstKind::VariableDeclarator(declarator)
+            if declarator
+              .init
+              .as_ref()
+              .is_some_and(|init| init.span() == await_span) =>
+          {
+            Some(DynamicImportBinding::Pattern(&declarator.id))
+          }
+          AstKind::StaticMemberExpression(member_expr)
+            if member_expr.object.span() == await_span =>
+          {
+            Some(DynamicImportBinding::Member(
+              member_expr.property.name.as_str(),
+              member_expr.span,
+            ))
+          }
+          _ => None,
+        }
+      }
+      _ => None,
+    }
+  }
+
+  /// The outermost of the parentheses and type assertions wrapping the
+  /// expression `node_id` (`(import("m") as Promise<M>)`), or the expression
+  /// itself, with its span.
+  fn outermost_wrapper(
+    nodes: &oxc_semantic::AstNodes<'_>,
+    node_id: oxc_semantic::NodeId,
+  ) -> (oxc_semantic::NodeId, Span) {
+    let mut current_id = node_id;
+    loop {
+      let parent_id = nodes.parent_id(current_id);
+      if parent_id == current_id {
+        break;
+      }
+      match nodes.get_node(parent_id).kind() {
+        AstKind::ParenthesizedExpression(_)
+        | AstKind::TSAsExpression(_)
+        | AstKind::TSSatisfiesExpression(_)
+        | AstKind::TSNonNullExpression(_)
+        | AstKind::TSTypeAssertion(_) => current_id = parent_id,
+        _ => break,
+      }
+    }
+    (current_id, nodes.get_node(current_id).kind().span())
   }
 
   /// Convert span to line and column

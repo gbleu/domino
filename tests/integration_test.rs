@@ -8659,6 +8659,222 @@ fn test_dynamic_import_of_export_less_script_propagates_change() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Dynamic imports binding the module they load
+// ---------------------------------------------------------------------------
+
+/// `widgetOptions` changes. Each loader reads one export of the module it
+/// loads through a `.then` callback; only the loader reading `widgetOptions`,
+/// and the file using it, are reached.
+#[test]
+fn test_dynamic_import_then_callback_reads_only_the_members_it_names() {
+  let via_files = side_effect_via_files(
+    &[
+      ("lib/widget.ts", WIDGET),
+      (
+        "options.ts",
+        "export const loadOptions = () =>\n  import(\"./lib/widget\").then((widget) => widget.widgetOptions);\n",
+      ),
+      (
+        "destructured.ts",
+        "export const loadOptions = () =>\n  import(\"./lib/widget\").then(({ widgetOptions }) => widgetOptions);\n",
+      ),
+      (
+        "lazy-options.ts",
+        "const lazy = <T>(load: () => Promise<T>) => load;\n\nexport const Options = lazy(() =>\n  import(\"./lib/widget\").then((module) => ({ default: module.widgetOptions })),\n);\n",
+      ),
+      (
+        "helper.ts",
+        "export const loadHelper = () =>\n  import(\"./lib/widget\").then((widget) => widget.unrelatedHelper);\n",
+      ),
+      (
+        "main.ts",
+        "import { loadOptions } from \"./options\";\n\nexport const main = () => loadOptions();\n",
+      ),
+    ],
+    &[("lib/widget.ts", Some(&widget_symbol_change()))],
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&[
+      "destructured.ts",
+      "lazy-options.ts",
+      "main.ts",
+      "options.ts"
+    ]),
+    "a .then callback reads the members it names, and only those"
+  );
+}
+
+/// `widgetOptions` changes. The module is bound by awaiting `import()`.
+#[test]
+fn test_dynamic_import_awaited_binding_reads_only_the_members_it_names() {
+  let via_files = side_effect_via_files(
+    &[
+      ("lib/widget.ts", WIDGET),
+      (
+        "binding.ts",
+        "export async function readOptions() {\n  const widget = await import(\"./lib/widget\");\n  return widget.widgetOptions;\n}\n",
+      ),
+      (
+        "destructured.ts",
+        "export async function readOptions() {\n  const { widgetOptions } = await import(\"./lib/widget\");\n  return widgetOptions;\n}\n",
+      ),
+      (
+        "member.ts",
+        "export async function readOptions() {\n  return (await import(\"./lib/widget\")).widgetOptions;\n}\n",
+      ),
+      (
+        "optional.ts",
+        "export async function readOptions() {\n  const widget = await import(\"./lib/widget\");\n  return widget?.widgetOptions;\n}\n",
+      ),
+      (
+        "exported.ts",
+        "export const widgetModule = await import(\"./lib/widget\");\n",
+      ),
+      (
+        "uses-exported.ts",
+        "import { widgetModule } from \"./exported\";\n\nexport const readOptions = () => widgetModule.widgetOptions;\n",
+      ),
+      (
+        "helper.ts",
+        "export async function readHelper() {\n  const { unrelatedHelper } = await import(\"./lib/widget\");\n  return unrelatedHelper();\n}\n",
+      ),
+    ],
+    &[("lib/widget.ts", Some(&widget_symbol_change()))],
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&[
+      "binding.ts",
+      "destructured.ts",
+      "exported.ts",
+      "member.ts",
+      "optional.ts",
+      "uses-exported.ts",
+    ]),
+    "an awaited import() reads the members it names, and only those; an exported binding \
+     hands the module to its importers"
+  );
+}
+
+/// `widgetOptions` changes. Each loader hands the whole module to other code,
+/// which can read any export.
+#[test]
+fn test_dynamic_import_module_used_as_a_value_reads_every_export() {
+  let via_files = side_effect_via_files(
+    &[
+      ("lib/widget.ts", WIDGET),
+      (
+        "register.ts",
+        "export const register = (module: object) => module;\n",
+      ),
+      (
+        "callback.ts",
+        "import { register } from \"./register\";\n\nexport const loadAll = () => import(\"./lib/widget\").then(register);\n",
+      ),
+      (
+        "argument.ts",
+        "import { register } from \"./register\";\n\nexport const loadAll = () =>\n  import(\"./lib/widget\").then((widget) => register(widget));\n",
+      ),
+      (
+        "awaited.ts",
+        "export async function listExports() {\n  const widget = await import(\"./lib/widget\");\n  return Object.keys(widget);\n}\n",
+      ),
+      (
+        "rest.ts",
+        "export async function readRest() {\n  const { unrelatedHelper, ...others } = await import(\"./lib/widget\");\n  return [unrelatedHelper, others];\n}\n",
+      ),
+    ],
+    &[("lib/widget.ts", Some(&widget_symbol_change()))],
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&["argument.ts", "awaited.ts", "callback.ts", "rest.ts"]),
+    "a module handed over as a value, or destructured with a rest element, has every \
+     export read"
+  );
+}
+
+/// `widgetOptions` of `lib/widget.ts` changes. Both loaders name their callback
+/// parameter `module` and read a `widgetOptions`, but only the first loads the
+/// changed module: each binding is followed through its own references.
+#[test]
+fn test_dynamic_import_bindings_are_followed_per_scope() {
+  let via_files = side_effect_via_files(
+    &[
+      ("lib/widget.ts", WIDGET),
+      ("lib/other.ts", "export const widgetOptions = [\"other\"];\n"),
+      (
+        "loaders.ts",
+        "export const loadWidget = () =>\n  import(\"./lib/widget\").then((module) => module.widgetOptions);\n\nexport const loadOther = () =>\n  import(\"./lib/other\").then((module) => module.widgetOptions);\n",
+      ),
+      (
+        "uses-widget.ts",
+        "import { loadWidget } from \"./loaders\";\n\nexport const useWidget = () => loadWidget();\n",
+      ),
+      (
+        "uses-other.ts",
+        "import { loadOther } from \"./loaders\";\n\nexport const useOther = () => loadOther();\n",
+      ),
+    ],
+    &[("lib/widget.ts", Some(&widget_symbol_change()))],
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&["loaders.ts", "uses-widget.ts"]),
+    "only the loader of the changed module, and its user, are reached"
+  );
+}
+
+/// The default export of `lib/panel.ts` changes. A bound import() reads the
+/// default export only when it names it; an unbound one, `.then()` without a
+/// callback included, keeps the default export rule (`lazy(() => import("./page"))`).
+#[test]
+fn test_dynamic_import_binding_reads_the_default_export_only_when_named() {
+  let panel = "export default function Panel() {\n  return \"panel\";\n}\n\nexport function PanelTitle() {\n  return \"title\";\n}\n";
+  let via_files = side_effect_via_files(
+    &[
+      ("lib/panel.ts", panel),
+      (
+        "default-read.ts",
+        "export const loadPanel = () => import(\"./lib/panel\").then((panel) => panel.default);\n",
+      ),
+      (
+        "named-read.ts",
+        "export const loadTitle = () =>\n  import(\"./lib/panel\").then((panel) => ({ default: panel.PanelTitle }));\n",
+      ),
+      (
+        "unbound.ts",
+        "export const loadPanel = () => import(\"./lib/panel\");\n",
+      ),
+      (
+        "passthrough.ts",
+        "export const loadPanel = () => import(\"./lib/panel\").then();\n",
+      ),
+      (
+        "ignores-module.ts",
+        "export const ping = () => import(\"./lib/panel\").then(() => true);\n",
+      ),
+    ],
+    &[(
+      "lib/panel.ts",
+      Some(&panel.replace("return \"panel\";", "return \"changed panel\";")),
+    )],
+  );
+
+  assert_eq!(
+    via_files,
+    paths(&["default-read.ts", "passthrough.ts", "unbound.ts"]),
+    "a bound import() reads the default export only when it names it; .then() without a \
+     callback passes the module on unbound, and a callback without a parameter reads nothing"
+  );
+}
+
 /// `polyfills/index.ts` drops the side-effect import of a deleted polyfill. The
 /// index is reached only through a namespace import that reads no member, and
 /// that file only through a side-effect import.

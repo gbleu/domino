@@ -32,6 +32,7 @@ exempt: they land by force-push, and their commits against `main` are upstream's
 
 | Patch | Upstream PR | State |
 | --- | --- | --- |
+| `fix(semantic): trace the members read off a bound dynamic import` | not submitted | worth sending with the dynamic-import cascade patch; upstream still isolates named exports behind `import()` at `v2.2.1` |
 | `fix(semantic): trace the names bound by destructured declarations` | not submitted | worth sending; upstream ignores destructured declarations at `v2.2.1` |
 | `feat(cli): add --report-format to write the report as JSON` | not submitted | worth sending; upstream's `--report` writes HTML only |
 | `fix(semantic): do not forward default exports through wildcard re-exports` | not submitted | worth sending with the namespace value-use patch |
