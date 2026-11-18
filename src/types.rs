@@ -176,6 +176,10 @@ pub struct Import {
   /// Dynamic imports with string literal specifiers are treated like static
   /// namespace imports — only explicit member access propagates changes.
   pub is_dynamic: bool,
+  /// Start offset of the `import()` expression of a dynamic import, `None` for a
+  /// static one. Locates the expression in the importing file's semantic model,
+  /// to find what the code reads off the module it loads.
+  pub dynamic_import_start: Option<u32>,
 }
 
 impl Import {

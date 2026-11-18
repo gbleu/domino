@@ -1,5 +1,6 @@
 use crate::error::Result;
 use crate::profiler::Profiler;
+use crate::semantic::analyzer::DynamicImportReads;
 use crate::semantic::WorkspaceAnalyzer;
 use crate::types::Reference;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -197,8 +198,23 @@ impl<'a> ReferenceFinder<'a> {
         );
 
         if *is_dynamic {
-          // The local binding of a dynamic import is synthetic ("__dynamic_import_N",
-          // see DynamicImportVisitor) — it never appears as an identifier in the
+          // Where the source binds the loaded module to a name
+          // (`.then((m) => m.foo)`, `const { foo } = await import()`), trace what
+          // it reads, as for a static namespace import binding: the member that
+          // names the symbol, and the uses that hand the whole module over.
+          if let Some(reads) = self.dynamic_import_reads(importing_file, local_name)? {
+            let member_reads = reads.members.into_iter().filter(|(member, _)| {
+              member == symbol_name || (is_default_export_symbol && member == "default")
+            });
+            all_refs.extend(member_reads.map(|(_, reference)| reference));
+            if is_exported {
+              all_refs.extend(reads.value_uses);
+            }
+            continue;
+          }
+
+          // Otherwise the local binding is synthetic ("__dynamic_import_N", see
+          // DynamicImportVisitor) — it never appears as an identifier in the
           // source, so the member-access analysis below can never attribute usage
           // to it: requiring member access makes dynamic imports propagate nothing
           // at all. But `React.lazy(() => import('./Page'))` DOES consume the
@@ -206,9 +222,8 @@ impl<'a> ReferenceFinder<'a> {
           // to static analysis. So cascade exactly that: when the propagated symbol
           // is the module's default export, conservatively mark the importing file
           // affected (line=0/column=0 sentinel — "entire file affected", core.rs).
-          // Named exports keep the lazy-boundary isolation introduced in #69:
-          // accessing them requires a visible binding (`.then(m => m.foo)`,
-          // `await import()`) that this analysis does not track.
+          // Named exports keep the lazy-boundary isolation introduced in #69: the
+          // promise is handed to code this analysis does not follow.
           if is_default_export_symbol {
             debug!(
               "Dynamic import of {:?} in {:?} consumes its default export ('{}') — \
@@ -477,6 +492,32 @@ impl<'a> ReferenceFinder<'a> {
     }
 
     Ok(())
+  }
+
+  /// What `importing_file` reads off the module its dynamic import `local_name`
+  /// loads, when it binds the module to a name (see
+  /// [`WorkspaceAnalyzer::find_dynamic_import_reads`]).
+  fn dynamic_import_reads(
+    &self,
+    importing_file: &Path,
+    local_name: &str,
+  ) -> Result<Option<DynamicImportReads>> {
+    let import_start = self
+      .analyzer
+      .imports
+      .get(importing_file)
+      .and_then(|imports| {
+        imports
+          .iter()
+          .find(|import| import.is_dynamic && import.local_name == local_name)
+      })
+      .and_then(|import| import.dynamic_import_start);
+    match import_start {
+      Some(import_start) => self
+        .analyzer
+        .find_dynamic_import_reads(importing_file, import_start),
+      None => Ok(None),
+    }
   }
 
   /// Report the uses of the namespace binding `local_name` of `importing_file` as
