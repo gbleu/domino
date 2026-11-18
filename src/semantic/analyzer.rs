@@ -42,6 +42,20 @@ pub struct DynamicImportReads {
   pub value_uses: Vec<Reference>,
 }
 
+/// Finds a reference to `arguments` (see `WorkspaceAnalyzer::reads_arguments`).
+#[derive(Default)]
+struct ArgumentsVisitor {
+  reads_arguments: bool,
+}
+
+impl<'a> Visit<'a> for ArgumentsVisitor {
+  fn visit_identifier_reference(&mut self, identifier: &oxc_ast::ast::IdentifierReference<'a>) {
+    if identifier.name == "arguments" {
+      self.reads_arguments = true;
+    }
+  }
+}
+
 /// How a dynamic `import()` binds the module it loads.
 enum DynamicImportBinding<'s> {
   /// A `.then` callback parameter or an awaited declaration.
@@ -1297,11 +1311,16 @@ impl WorkspaceAnalyzer {
           .map(Expression::without_parentheses)
         {
           Some(Expression::ArrowFunctionExpression(arrow)) => &arrow.params,
-          Some(Expression::FunctionExpression(function)) => &function.params,
+          // A function can read the module through `arguments`, whatever it declares.
+          Some(Expression::FunctionExpression(function)) if !Self::reads_arguments(function) => {
+            &function.params
+          }
           _ => return Some(DynamicImportBinding::Value(callback.span())),
         };
         Some(match parameters.items.first() {
           Some(parameter) => DynamicImportBinding::Pattern(&parameter.pattern),
+          // `(...args) => args[0]` receives the module in its rest element.
+          None if parameters.rest.is_some() => DynamicImportBinding::Value(callback.span()),
           None => DynamicImportBinding::Nothing,
         })
       }
@@ -1330,6 +1349,17 @@ impl WorkspaceAnalyzer {
       }
       _ => None,
     }
+  }
+
+  /// Whether `function` references `arguments`. A reference in a nested
+  /// function counts too: it can only make the callback read more.
+  fn reads_arguments(function: &oxc_ast::ast::Function) -> bool {
+    let mut visitor = ArgumentsVisitor::default();
+    visitor.visit_formal_parameters(&function.params);
+    if let Some(body) = &function.body {
+      visitor.visit_function_body(body);
+    }
+    visitor.reads_arguments
   }
 
   /// The outermost of the parentheses and type assertions wrapping the
